@@ -1,0 +1,16 @@
+build/
+build.clang/
+components/esp_avb/
+components/esp_ptp/
+managed_components/
+reference/
+releases/
+.vscode/
+.claude/
+.codex
+AGENTS.md
+*.lock
+sdkconfig
+.DS_Store
+*.old
+sdkconfig.old

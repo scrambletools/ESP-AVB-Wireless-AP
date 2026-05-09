@@ -1,0 +1,71 @@
+# ESP-AVB-Wireless-AP defaults — Waveshare ESP32-P4-WiFi6-PoE-ETH (ESP1):
+# P4 host owns Ethernet + AVB stack; onboard C6 over SDIO is the Wi-Fi
+# co-processor (driven by c6_firmware/, brought up in Phase 4+).
+
+CONFIG_IDF_TARGET="esp32p4"
+
+# ESP1's P4 silicon is rev v1.3; same pre-v3 boot fix as the example.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+CONFIG_ESP_NETIF_L2_TAP=y
+
+# Onboard PHY uses the same IP101 footprint as the existing example.
+CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET=y
+CONFIG_EXAMPLE_ETH_PHY_IP101=y
+
+# AVB role + per-port config. Phase 4 builds with NUM_PORTS=1 so the
+# bridge skeleton compiles without exercising any 2-port code paths.
+# Phase 5 bumps this to 2 and lights up the Wi-Fi port.
+CONFIG_ESP_AVB_ROLE_BRIDGE=y
+CONFIG_ESP_AVB_NUM_PORTS=1
+CONFIG_ESP_AVB_PORT0_MEDIUM_ETHERNET=y
+CONFIG_ESP_AVB_PORT0_TIME_SOURCE_GPTP_WIRED=y
+
+# esp_ptp matching port count.
+CONFIG_ESP_PTP_NUM_PORTS=1
+
+# gPTP intervals matching the example.
+CONFIG_NETUTILS_PTPD_PRIORITY1=246
+CONFIG_NETUTILS_PTPD_TIMEOUT_MS=10000
+CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS=100
+CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS=125
+CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS=1000
+
+# AVB Lite stays advertised on the wired side; the bridge runs full
+# AVB on Ethernet but Class B on Wi-Fi (Phase 5).
+CONFIG_ESP_AVB_AVB_LITE_COMPLIANT=y
+
+# ESP-Hosted SDIO host configuration for the Waveshare
+# ESP32-P4-WIFI6-PoE-ETH onboard P4 ↔ C6 bus.
+#
+# Wiring (per Documents/Specs/ESP32-P4-WIFI6-POE-ETH-Schematic.pdf):
+#   CLK : P4 GPIO19 ↔ C6 IO19   (C6 SDIO_SLAVE_CLK, HW-fixed)
+#   CMD : P4 GPIO18 ↔ C6 IO18   (C6 SDIO_SLAVE_CMD, HW-fixed)
+#   D0  : P4 GPIO15 ↔ C6 IO15   (C6 SDIO_SLAVE_DAT0, HW-fixed)
+#   D1  : P4 GPIO16 ↔ C6 IO16   (wired but unused in 1-bit mode)
+#   D2  : P4 GPIO17 ↔ C6 IO17   (wired but unused in 1-bit mode)
+#   D3  : not wired              (C6 GPIO20 is repurposed as UART0 TX)
+# Bus width is therefore 1-bit. 51 kΩ pullups to ESP_3V3 on every line.
+CONFIG_ESP_HOSTED_ENABLE=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS=y
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=18
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=19
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=15
+
+# FreeRTOS / EMAC settings cloned from the example.
+CONFIG_FREERTOS_ISR_STACKSIZE=6144
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ETH_TRANSMIT_MUTEX=n
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+CONFIG_ETH_IRAM_OPTIMIZATION=y
+CONFIG_ETH_DMA_RX_BUFFER_NUM=30
+CONFIG_ESP_NETIF_L2_TAP_RX_QUEUE_SIZE=64
+CONFIG_ETH_DMA_BUFFER_SIZE=1536
