@@ -1,7 +1,7 @@
 build/
 build.clang/
-components/esp_avb/
-components/esp_ptp/
+components/esp_*
+components/esp_*
 managed_components/
 reference/
 releases/
