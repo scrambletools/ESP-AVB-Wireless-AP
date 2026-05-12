@@ -1,7 +1,6 @@
 build/
 build.clang/
 components/esp_*
-components/esp_*
 managed_components/
 reference/
 releases/

@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
  * SDIO transport between the ESP32-P4 host and the onboard ESP32-C6
- * Wi-Fi co-processor on ESP-AVB-Wireless-AP. ESP-Hosted-style framing
+ * Wi-Fi coprocessor on ESP-AVB-Bridge. ESP-Hosted-style framing
  * with 6 channels, 12-byte header, credit-based flow control on
  * channel 1 (control). Implementation is Phase 4 in-progress; this
  * header defines the protocol so both sides can agree.

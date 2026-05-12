@@ -1,0 +1,14 @@
+# Overrides applied on top of upstream esp-hosted-mcu/slave's
+# sdkconfig.defaults and sdkconfig.defaults.esp32c6. Anything not set
+# here inherits from upstream. Only customizations the AVB-Wireless-AP
+# project genuinely needs belong in this file.
+
+# Build the coprocessor-side PTP custom-RPC handler from the
+# esp_ptp_rpc component (symlinked into ./components/).
+CONFIG_PTP_RPC_BUILD_COPROCESSOR_HANDLER=y
+
+# Bring-up diagnostics: verbose bootloader + DEBUG runtime logs on
+# the coprocessor's UART0 so flash/boot issues are visible without
+# rebuilding. Drop these once Phase 8 stabilizes.
+CONFIG_BOOTLOADER_LOG_LEVEL_VERBOSE=y
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y

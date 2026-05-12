@@ -1,0 +1,248 @@
+/*
+ * Copyright 2026 Scramble Tools
+ * License: MIT
+ *
+ * ESP-AVB-Bridge — Ethernet ↔ Wi-Fi AVB bridge (access point).
+ *
+ * Hardware: Waveshare ESP32-P4-WiFi6-PoE-ETH (ESP1). The P4 owns
+ * Ethernet + the AVB stack; the onboard ESP32-C6 is the Wi-Fi
+ * co-processor reached over SDIO bus (CMD=GPIO18, CLK=GPIO19,
+ * D0=GPIO15)
+ *
+ * Wi-Fi access on the host side is via Espressif's `esp_hosted` /
+ * `esp_wifi_remote` managed components: standard esp_wifi_* APIs are
+ * RPC'd transparently over SDIO to the coprocessor. The coprocessor
+ * runs Espressif's upstream ESP-Hosted firmware unmodified — we
+ * extend functionality from the host side rather than fork it.
+ */
+
+#include "esp_avb.h"
+#include "esp_eth_clock.h"
+#include <driver/gpio.h>
+#include <esp_check.h>
+#include <esp_eth.h>
+#include <esp_eth_phy_ip101.h>
+#include <esp_event.h>
+#include <esp_intr_alloc.h>
+#include <esp_log.h>
+#include <esp_netif.h>
+#include <esp_vfs_l2tap.h>
+#include <esp_wifi.h>
+#include <ethernet_init.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <nvs_flash.h>
+#include <ptpd.h>
+#include <sdkconfig.h>
+#include <string.h>
+
+static const char *TAG = "avb_bridge";
+static esp_eth_handle_t s_eth_handle;
+static char s_avb_eth_interface[10];
+static esp_netif_t *s_wifi_ap_netif = NULL;
+static SemaphoreHandle_t s_ap_started = NULL;
+
+/* WIFI_EVENT_AP_START handler — releases the semaphore that gates
+ * avb_start so port[1] init reads a populated MAC instead of zeros.
+ * The Wi-Fi driver assigns the AP's MAC into the netif synchronously
+ * with this event firing, so esp_netif_get_mac is reliable from here on. */
+static void on_ap_start(void *arg, esp_event_base_t base, int32_t id,
+                        void *data) {
+  (void)arg;
+  (void)base;
+  (void)id;
+  (void)data;
+  if (s_ap_started) {
+    xSemaphoreGive(s_ap_started);
+  }
+}
+
+/* SoftAP defaults. Open auth for initial proof-of-concept;
+ * encrypted Wi-Fi (WPA2/3) is in the plan. */
+#define AVB_AP_SSID "ESP-AVB-Bridge"
+#define AVB_AP_CHANNEL 6
+#define AVB_AP_MAX_CONN 4
+/* Beacon interval — TUs of 1024 µs. 100 TU = 102.4 ms, the spec
+ * default. IEEE 802.1AS-2020 §12.8.2 prefers ~125 ms (logSyncInterval
+ * = -3) for gPTP over Wi-Fi; ESP-IDF documents beacon_interval in
+ * multiples of 100, so we accept the small mismatch for Phase 4 and
+ * revisit cadence in Phase 7 once we measure beacon-IE jitter. */
+#define AVB_AP_BEACON_INTERVAL 100
+
+static void init_ethernet_and_netif(void) {
+  /* The default event loop may already exist by the time we get here
+   * (esp_ptp's ptp_beacon_ie.c creates it from a constructor so it
+   * can register a WIFI_EVENT_AP_START handler). ESP_ERR_INVALID_STATE
+   * means "already created", which is fine. */
+  esp_err_t loop_r = esp_event_loop_create_default();
+  if (loop_r != ESP_OK && loop_r != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(loop_r);
+  }
+
+  eth_esp32_emac_config_t emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+  eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+  eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+
+  emac_config.dma_burst_len = ETH_DMA_BURST_LEN_32;
+  emac_config.intr_priority = 0;
+  mac_config.rx_task_stack_size = 16384;
+  mac_config.rx_task_prio = 22;
+  phy_config.phy_addr = 1;
+  phy_config.reset_gpio_num = 5;
+
+  esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac_config, &mac_config);
+  esp_eth_phy_t *phy = esp_eth_phy_new_ip101(&phy_config);
+
+  esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+  ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_vfs_l2tap_intf_register(NULL));
+
+  esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_ETH();
+  esp_netif_config_t cfg = {.base = &base,
+                            .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH};
+  base.if_key = "ETH_0";
+  base.if_desc = "eth0";
+  base.route_prio = 50;
+  esp_netif_t *eth_netif = esp_netif_new(&cfg);
+
+  ESP_ERROR_CHECK(
+      esp_netif_attach(eth_netif, esp_eth_new_netif_glue(s_eth_handle)));
+
+  memcpy(s_avb_eth_interface, base.if_key, strlen(base.if_key));
+  ESP_LOGI(TAG, "AVB Ethernet interface: %s", s_avb_eth_interface);
+
+  ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
+}
+
+/* Bring up the SoftAP via esp_wifi_remote (transparent SDIO RPC to
+ * the onboard coprocessor). The first esp_wifi_init call drives the
+ * SDIO host-coprocessor handshake; if the coprocessor hasn't been
+ * flashed with the ESP-Hosted firmware this will fail at boot */
+static void init_wifi_softap(void) {
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ESP_ERROR_CHECK(nvs_flash_init());
+  }
+
+  /* Create the AP netif. ESP_NETIF_FLAG_AUTOUP keeps the netif up
+   * regardless of L3 (we have no IP on the AP — it's an L2 bridge
+   * member). The bridge example uses the same flag pattern.
+   *
+   * if_key="WIFI_0" matches what avb_config.wifi_interface passes
+   * down so esp_avb's port[1] L2TAP fds bind to this exact netif. */
+  esp_netif_inherent_config_t ap_inherent =
+      ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
+  ap_inherent.flags = ESP_NETIF_FLAG_AUTOUP;
+  ap_inherent.ip_info = NULL;
+  ap_inherent.if_key = "WIFI_0";
+  ap_inherent.if_desc = "wifi0";
+  s_wifi_ap_netif = esp_netif_create_wifi(WIFI_IF_AP, &ap_inherent);
+  ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
+
+  wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+  wifi_config_t wifi_cfg = {
+      .ap =
+          {
+              .ssid = AVB_AP_SSID,
+              .ssid_len = strlen(AVB_AP_SSID),
+              .channel = AVB_AP_CHANNEL,
+              .password = "",
+              .max_connection = AVB_AP_MAX_CONN,
+              .authmode = WIFI_AUTH_OPEN,
+              .beacon_interval = AVB_AP_BEACON_INTERVAL,
+              /* FTM responder so wireless endpoints can measure
+               * peer-delay against us per Path C. The coprocessor HW
+               * supports it; ESP-Hosted RPCs the flag transparently. */
+              .ftm_responder = true,
+          },
+  };
+
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg));
+  /* Power save off on the AP — required for predictable beacon
+   * timing once we start publishing FollowUpInformation in the
+   * beacon Vendor IE. Leaving it off from boot avoids a
+   * later runtime toggle. */
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+  /* Set up the AP_START gate before esp_wifi_start so we don't miss
+   * the event. esp_avb's port[1] init reads the netif MAC immediately;
+   * if we don't wait, it gets zeros (the driver populates the MAC
+   * synchronously with WIFI_EVENT_AP_START, not with esp_wifi_start). */
+  s_ap_started = xSemaphoreCreateBinary();
+  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,
+                                             on_ap_start, NULL));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  if (xSemaphoreTake(s_ap_started, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    ESP_LOGW(TAG, "Wi-Fi AP_START event did not fire within 5s; "
+                  "port[1] MAC may be zero");
+  }
+  esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_START, on_ap_start);
+
+  ESP_LOGI(TAG, "Wi-Fi SoftAP up: SSID='%s' ch=%d beacon=%d TU max_conn=%d",
+           AVB_AP_SSID, AVB_AP_CHANNEL, AVB_AP_BEACON_INTERVAL,
+           AVB_AP_MAX_CONN);
+}
+
+void app_main(void) {
+  struct timespec cur_time;
+
+  init_ethernet_and_netif();
+  ESP_LOGI(TAG, "Ethernet started");
+
+  ptpd_start(s_avb_eth_interface);
+
+  while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  init_wifi_softap();
+
+  /* AVB stack — bridge role. NUM_PORTS=2: port[0]=Ethernet (EMAC),
+   * port[1]=Wi-Fi AP (over esp_wifi_remote → onboard C6). The L2
+   * forwarder runs out of esp_avb's avb_unified_rx_cb on both
+   * ingress hooks (EMAC for port 0, WIFI_IF_AP for port 1). */
+  avb_config_s avb_config = AVB_DEFAULT_CONFIG();
+  avb_config.entity_name = "AVB Bridge";
+  avb_config.eth_handle = s_eth_handle;
+  avb_config.eth_interface = "ETH_0";
+  avb_config.wifi_interface = "WIFI_0";
+
+  bool enable = true;
+  if (esp_eth_ioctl(s_eth_handle, ETH_CMD_S_PROMISCUOUS, &enable) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set ethernet to promiscuous mode");
+    abort();
+  }
+  /* IDF's ETH_CMD_S_PROMISCUOUS only sets gmacff.pmode (unicast). The
+   * GMAC has a separate frame-filter bit gmacff.pam ("pass all
+   * multicast") for multicast destinations. Without this, only MACs
+   * that lwIP has subscribed via eth_set_mac_filter pass through —
+   * which on the bridge means we'd silently drop AVTP (91:e0:f0:01:..)
+   * and MVRP (01:80:c2:00:00:21) and the bridge classifier would
+   * never see them. */
+  if (esp_eth_ioctl(s_eth_handle, ETH_CMD_S_ALL_MULTICAST, &enable) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to enable pass-all-multicast on EMAC");
+    abort();
+  }
+
+  avb_start(&avb_config);
+
+  /* Beacon-IE publish is fully owned by esp_ptp: when
+   * CONFIG_ESP_PTP_HAS_WIFI_CP_AP is set, esp_ptp's ptp_beacon_ie.c installs a
+   * WIFI_EVENT_AP_START handler at startup and dispatches SET_VENDOR_IE_REQ the
+   * moment the SoftAP comes up. Nothing for this host to do — it just brings up
+   * the SoftAP. */
+
+  ESP_LOGI(TAG, "AVB bridge up — Ethernet + Wi-Fi AP, L2 forwarder armed");
+
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "heartbeat");
+  }
+}

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * P4-side SDIO host driver for ESP-AVB-Wireless-AP. Phase 4 in
+ * P4-side SDIO host driver for ESP-AVB-Bridge. Phase 4 in
  * progress — protocol surface defined in sdio_avb_link.h, transport
  * bring-up pending hardware verification (SDIO host pin map for the
  * Waveshare ESP32-P4-WiFi6-PoE-ETH combo board).
