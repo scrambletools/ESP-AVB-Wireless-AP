@@ -271,6 +271,13 @@ void app_main(void) {
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "heartbeat");
+    uint32_t eth_ok = 0, eth_fail = 0, wifi_ok = 0, wifi_fail = 0, wifi_oom = 0;
+    avb_bridge_forward_stats(&eth_ok, &eth_fail, &wifi_ok, &wifi_fail,
+                             &wifi_oom);
+    ESP_LOGI(TAG,
+             "heartbeat  fwd eth=%lu/%lu  wifi=%lu/%lu  oom=%lu  STA=%u",
+             (unsigned long)eth_ok, (unsigned long)eth_fail,
+             (unsigned long)wifi_ok, (unsigned long)wifi_fail,
+             (unsigned long)wifi_oom, avb_bridge_wifi_ap_sta_count());
   }
 }
