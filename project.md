@@ -5,12 +5,33 @@
 | Phase | Status |
 | --- | --- |
 | **1 — Generic MRP core + MSRP cutover (endpoint mode)** | **done** — committed as `0eefbcd` in `esp_avb`, validated on ESP2 wired endpoint |
-| **2 — Bridge MAP + admission + Wi-Fi cuts** | next |
-| 3 — Real MSRP listener state driver | pending |
-| 4 — MVRP on the MRP core | pending |
+| **2 — Bridge MAP + admission + Wi-Fi cuts** | **done** — folded into `8a73263` in `esp_avb`; bridge bring-up validated on ESP1 (P4+C6 over SDIO) |
+| **3 — Real MSRP listener state driver** | **done** — `8a73263`; listener decl_event now queries the SM directly via `mrp_talker_advertise_active` / `mrp_talker_failed_active` (no transition-edge race), ATDECC CLASS_B flag plumbed through the talker side |
+| **4 — MVRP on the MRP core** | **done** — `8a73263`; §7 in `mrp.c` with bridge MAP symmetric to MSRP |
 
-`esp_avb` HEAD: `0eefbcd feat: MRP state machines + header split`
-on top of `5aa5be5 feat: L2 bridge` (commit not yet pushed).
+`esp_avb` HEAD: `8a73263 feat: SM-driven MRP, bridge MAP, MVRP, CLASS_B`
+on top of `0eefbcd feat: MRP state machines + header split`.
+
+Adjacent fixes that landed alongside the phases above:
+
+- **Outstanding polish #1** — legacy `avb_process_msrp_*` reactions
+  migrated into the `mrp_on_*_registrar_change` callbacks and deleted.
+- **Outstanding polish #2** — Wi-Fi `LeaveAllTimer` jitter widening (30 s
+  base + 30 s jitter on Wi-Fi-medium ports) and STA-presence gating
+  (suppress LeaveAll bursts while the SoftAP has zero associated STAs).
+- **Outstanding polish #5** — `s_mrp_tx_shadow` debug knob removed (was
+  always `false` in tree, leftover from Phase-1 shadow-mode validation).
+- **Port-typology refactor** — orthogonal per-port attributes
+  (`host_if`, `type`, `wifi_mode`, `link_speed_mbps`) in both `esp_ptp`
+  and `esp_avb`, sourced from `esp_ptp` Kconfig.
+- **ATDECC CLASS_B flag** — IEEE 1722.1 §8.2.1.16: talker honors the
+  bit in CONNECT_TX, first ACMP listener wins the class, mismatch
+  rejected with `talker_exclusive`. `--class-b` flag added to
+  `avb_controller.py`.
+- **Safe P4 reflash procedure** — hold the C6's `EN` low via the
+  ESP-Prog-2's RTS on `/dev/ttyACM?` while flashing the P4 over
+  `/dev/ttyACM0`. Documented in `AGENTS.md`. Sidesteps the C6 SDIO
+  wedge that otherwise reliably triggers on bridge reflash.
 
 ## Goal (unchanged)
 
@@ -212,45 +233,53 @@ loop every 500 ms. To move it onto the generic SMs:
 MVRP has no admission control and no per-class semantics, so it's
 much simpler than MSRP. ~50 LOC.
 
-## Outstanding polish (small, can land any time)
+## Outstanding polish
 
-1. **Migrate legacy `avb_process_msrp_*` reactions to on_registrar_change
-   callbacks** — currently called from inside `mrp_rx_msrp` on every
-   RX. Phase 2 prerequisite. After Phase 2, the legacy functions
-   can be deleted entirely.
-2. **Wi-Fi LeaveAll jitter widening and STA-presence gating** — listed
-   under Phase 2 but trivially independent.
-3. **`avb_send_msrp_attr` cleanup** — still in `mrp.c`, used by
+Items that landed alongside the main phases (see status table for
+commits):
+
+- ~~Migrate legacy `avb_process_msrp_*` reactions into
+  `on_registrar_change` callbacks~~ — done; legacy functions deleted.
+- ~~Wi-Fi `LeaveAllTimer` widening and STA-presence gating~~ — done.
+- ~~`s_mrp_tx_shadow` flag removed~~ — done.
+- ~~Rename detection cosmetic~~ — moot; the §7 MVRP addition kept
+  the `msrp.c → mrp.c` similarity above git's rename threshold, so
+  history follows naturally now.
+
+Still pending:
+
+1. **`avb_send_msrp_attr` cleanup** — still in `mrp.c`, used by
    `mrp_tx_flush_*`. Could be inlined or renamed to `mrp_send_attr`.
-4. **MSRP attribute aggregation on bridge** — when multiple
-   downstream listeners exist per §35.2.4.4.3, the bridge merges
-   their declarations into one upstream LISTENER on the talker-facing
-   port. Not yet implemented; needed for full Milan compliance but
-   not for basic AVB.
-5. **`s_mrp_tx_shadow` flag** is in tree but always `false` —
-   leftover from Phase 1 shadow-mode validation. Can be removed or
-   left as a debug knob.
-6. **Rename detection** — the Phase 1 commit shows `msrp.c` deletion
-   + `mrp.c` creation rather than a rename (content similarity
-   dropped below git's 50% threshold from the SM additions).
-   `git log --follow mrp.c` still traces history. Cosmetic only.
+2. **MSRP attribute aggregation on bridge** (IEEE 802.1Q-2018
+   §35.2.4.4.3) — when multiple downstream listeners exist, the
+   bridge should merge their declarations into one upstream LISTENER
+   on the talker-facing port. Today we propagate 1:1. Needed for
+   full Milan multi-listener compliance, not for basic AVB.
+3. **Bridge wired→Wi-Fi multicast forwarding** — observed during
+   Phase 3 demo: the controller's `CONNECT_RX_COMMAND` (multicast
+   `91:e0:f0:01:00:00`) didn't always reach ESP3 over the SoftAP
+   while ADP advertisements in the reverse direction did. SoftAP
+   multicast egress / `avb_bridge_classify` worth a closer look.
+4. **gPTP-over-Wi-Fi listener-side timing** — Hive observed ESP3
+   with `grandmaster_id=0` after associating to the bridge SoftAP.
+   Beacon-IE FollowUpInformation consumer on the C6 endpoint isn't
+   yet wired up to update PTP state. Separate from the MSRP path.
 
-## Code locations after Phase 1
-
-Files renamed / created / heavily modified:
+## Code locations
 
 | File | Role |
 | --- | --- |
-| `esp_avb/mrp.c` (was `msrp.c`) | MRP SMs (§1–§1b), MSRP application (§6), MAAP (§8 historical). The SM-driven entry points are at §1b and §6a/b/c. Legacy `avb_process_msrp_*` and `avb_send_msrp_attr` still live here as helpers/reactions. |
-| `esp_avb/mrp.h` | Public SM API: `mrp_applicant_step`, `mrp_registrar_step`, `mrp_port_init/tick/arm_join_timer`, `mrp_rx_msrp`, `mrp_declare_*`, `mrp_withdraw_*`. Plus the wire types and enums. |
-| `esp_avb/avb.h` | Now ~948 lines. Holds `avb_state_s`, `ctrl_rx_pkt_t` (with `ingress_port` field), `avb_msgbuf_u`, NVS persist types, codec caps. Includes `mrp.h`, `avtp.h`, `atdecc.h` transitively. |
+| `esp_avb/mrp.c` | MRP SMs (§1–§1b), MSRP application (§6), MVRP application (§7), MAAP (§8). All MSRP/MVRP RX flows through `mrp_rx_msrp` / `mrp_rx_mvrp` → SM dispatch → `on_*_registrar_change` callbacks; origination via `mrp_declare_*` / `mrp_withdraw_*`. Bridge MAP propagation + admission live in §6a. |
+| `esp_avb/mrp.h` | Public SM API: `mrp_applicant_step`, `mrp_registrar_step`, `mrp_port_init/tick/arm_join_timer`, `mrp_rx_msrp`, `mrp_rx_mvrp`, `mrp_declare_*`, `mrp_withdraw_*`, `mrp_talker_advertise_active`, `mrp_talker_failed_active`. Plus the wire types and enums. |
+| `esp_avb/avb.h` | `avb_state_s`, `ctrl_rx_pkt_t` (with `ingress_port`), `avb_msgbuf_u`, NVS persist types, codec caps. Per-port topology fields (`host_if`, `type`, `wifi_mode`, `link_speed_mbps`). Declares `avb_input_stream_decl_event`, `avb_net_send_on`. |
+| `esp_avb/include/esp_avb.h` | Public enums for the port topology: `avb_port_medium_e`, `avb_port_host_if_e`, `avb_port_type_e`, `avb_port_wifi_mode_e`. |
 | `esp_avb/avtp.h` | 1722 stream payloads + MAAP. |
 | `esp_avb/atdecc.h` | 1722.1 + MVU/CVU + `avtp_msgbuf_u`. |
-| `esp_avb/avb.c` | `avb_initialize_state` calls `mrp_port_init` per port. `avb_periodic_send` calls `mrp_port_tick` and the SM-driven `mrp_declare_*` instead of legacy `avb_send_msrp_*`. RX dispatch is one `mrp_rx_msrp` call. |
-| `esp_avb/avbnet.c` | EMAC RX populates `ctrl_rx_pkt_t.ingress_port`. `avb_net_recv_ctrl` exposes it via an out-param. |
-| `esp_avb/atdecc.c` | ACMP CONNECT/DISCONNECT rewired to `mrp_declare_listener` / `mrp_withdraw_listener`. |
-| `esp_avb/avbbridge.c` | Unchanged in Phase 1. Phase 2 MAP work likely lands here or in a new `avbmap.c`. |
-| `esp_avb/CMakeLists.txt` | `mrp.c` replaces `msrp.c` in the source list. |
+| `esp_avb/avb.c` | Port-init populates topology from Kconfig. `avb_periodic_send` calls `mrp_port_tick`, then `mrp_declare_*` per class. `avb_input_stream_decl_event` queries SM directly for the right listener decl_event. RX dispatch is one `mrp_rx_msrp` / `mrp_rx_mvrp` call. |
+| `esp_avb/avbnet.c` | Unified EMAC + Wi-Fi RX → `avb_unified_rx_cb` → bridge classifier (bridge mode) or ctrl_rx_queue (endpoint). `avb_net_send_on(port, …)` for per-port control-plane TX. |
+| `esp_avb/atdecc.c` | ACMP CONNECT/DISCONNECT drive `mrp_declare_listener` / `mrp_withdraw_listener` with decl_event from the helper. CLASS_B flag honored on talker side with class-mismatch gate. |
+| `esp_avb/avbbridge.c` | L2 forwarder + SoftAP STA-association count (fed by the bridge application's WIFI_EVENT handlers; read by `mrp_port_tick` for LeaveAll suppression). |
+| `esp_avb/CMakeLists.txt` | `mrp.c` source list; bridge-only files (`avbbridge.c`, `avbfqtss.c`) gated on `CONFIG_ESP_AVB_ROLE_BRIDGE`. |
 
 Helpful pre-existing infrastructure for Phase 2:
 
@@ -343,9 +372,9 @@ Helpful pre-existing infrastructure for Phase 2:
 ## What to know if you're picking this up
 
 1. **Read `esp_avb/mrp.c` top-to-bottom first.** The §1–§8 sectioning
-   in the file header is the architectural map. §1 (SMs) and §6
-   (MSRP application) are mode-agnostic; Phase 2 lands in §6c
-   (MAP) and/or a new file.
+   in the file header is the architectural map: §1 generic MRP SMs,
+   §6 MSRP application (RX entry in §6a, origination in §6b, TX
+   flush in §6c, plus bridge MAP + admission), §7 MVRP, §8 MAAP.
 
 2. **Endpoint mode is the regression baseline.** Don't break ESP2 +
    Mac mini / MOTU peering. Flash ESP2 after each change, look for:
@@ -354,26 +383,30 @@ Helpful pre-existing infrastructure for Phase 2:
    - No `over budget` warnings
    - Hive can still enumerate the entity
 
-3. **Bridge mode is `CONFIG_ESP_AVB_ROLE_BRIDGE` builds** —
-   `cd ESP-AVB-Bridge && idf.py build`. The ESP-AVB-Bridge project
-   is preset for the P4 bridge build. Endpoint vs bridge is derived
-   from `esp_ptp` Kconfig (see `Kconfig.projbuild` in `esp_avb`).
+3. **Bridge mode is `CONFIG_ESP_AVB_ROLE_BRIDGE` builds** — derived
+   from `esp_ptp` Kconfig (any port `type=bridged` flips the flag).
+   The ESP-AVB-Bridge project is preset for the P4 bridge build.
+   When reflashing the P4, **hold the C6's `EN` low via the
+   ESP-Prog-2 RTS during flash** (see AGENTS.md) — otherwise the
+   C6's SDIO link wedges on next boot.
 
 4. **The MRP SMs are spec-faithful per §10.7.7 / §10.7.8.** If
    adding transitions, cross-check Table 10-3 and Table 10-4. The
    `[s]` notation in Table 10-3 means optional on shared media —
    our convention is to suppress (already done for LO → VO).
 
-5. **The legacy `avb_process_msrp_*` reactions still run on every
-   RX (not just transitions)** because they were not refactored
-   into Registrar-transition callbacks during Phase 1. That's the
-   first cleanup before MAP can hook in cleanly. See
-   "Outstanding polish" #1 above.
+5. **Per-port topology axes** (`avb_port_s` / `ptp_port_s`):
+   `medium` × `host_if` × `type` × `wifi_mode` × `link_speed_mbps`.
+   All orthogonal, all sourced from `esp_ptp` Kconfig. `host_if`
+   (emac / ahb / sdio / spi / usb / other) is the performance
+   classifier — admission cap and Wi-Fi cuts derive from it +
+   `medium`.
 
-6. **`s_mrp_tx_shadow` is a runtime debug knob** in `mrp.c` (always
-   `false` in tree). Flip to `true` if you want SM activity logged
-   without it actually transmitting — useful for diffing expected
-   vs actual behavior during Phase 2 bring-up.
+6. **CLASS_B selection happens at ACMP CONNECT_TX** — first ACMP
+   listener wins the class on the talker side; mismatched
+   subsequent connects are rejected with `talker_exclusive`.
+   `mrp_declare_talker_advertise/_failed` take `class_b` and
+   thread it to the wire `priority` field.
 
 ## Recent context (carried forward from earlier sessions)
 
@@ -399,8 +432,8 @@ Helpful pre-existing infrastructure for Phase 2:
   `ESP_HOSTED_MCU_DIR`) and wires three relative symlinks. Host
   build needs no manual setup — all deps come from the IDF Component
   Registry.
-- **C6 wireless Class B workaround** (still in tree, pre-Phase-1):
-  ESP3 declares its streams as Class B on Wi-Fi medium so the
-  bridge's v1 admission policy accepts them. With Phase 2 MAP doing
-  the right thing this is technically redundant but harmless;
-  defer removal until Phase 2 is validated.
+- **C6 wireless Class B workaround**: ESP3 historically declared its
+  streams as Class B on Wi-Fi medium so the bridge's v1 admission
+  policy accepted them. Now redundant — Class selection is per-
+  connection via the ACMP CLASS_B flag and the admission gate /
+  Wi-Fi cuts handle Class A on Wi-Fi correctly. Safe to remove.
