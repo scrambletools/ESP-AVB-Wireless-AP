@@ -20,7 +20,7 @@ the SoftAP that speaks AVB-over-Wi-Fi will interoperate.
   egress side. Wi-Fi admits Class B only in v1; Class A reservations
   propagating from the wired side are rejected with
   `insufficient_bandwidth_for_traffic_class`.
-- gPTP grandmaster / boundary clock on the wired side via `esp_ptp`'s
+- gPTP BTC / boundary clock on the wired side via `esp_ptp`'s
   hardware-clock backend on the P4 EMAC.
 - Beacon Vendor IE publisher for `FollowUpInformation` on the SoftAP,
   installed via custom RPC over SDIO to the coprocessor — no host
@@ -64,36 +64,29 @@ Target board: **Waveshare ESP32-P4-WiFi6-PoE-ETH**.
 
 ```
 ESP-AVB-Bridge/
-  main/                  P4 host application (AVB stack + SoftAP setup)
+  main/                  P4 host application (AVB stack + SoftAP
+                         setup). idf_component.yml pulls
+                         scrambletools/esp_avb and esp_ptp from the
+                         ESP Component Registry; esp_ptp_rpc comes in
+                         transitively.
   sdkconfig.defaults     P4 host defaults (target=esp32p4, AVB role,
-                         esp_ptp port topology, ESP-Hosted SDIO config)
-  components/            Symlinks to the shared AVB components:
-    esp_avb            → esp_avb registered component
-    esp_ptp            → esp_ptp registered component
-    esp_ptp_rpc        → scrambletools/esp_ptp_rpc repo (Github)
-    sdio_avb_link/       Bridge-local SDIO link helpers
-  common               → espressif/esp-hosted-mcu repo /common dir
-                         (needed by the coprocessor build's
-                         "../../common" fallback path)
+                         esp_ptp port topology, ESP-Hosted SDIO
+                         config).
+  components/
+    sdio_avb_link/       Bridge-local SDIO link helpers.
 
-  coprocessor/           Coprocessor (C6) firmware build root
+  coprocessor/           Coprocessor (C6) firmware build root.
     CMakeLists.txt       Mirrors upstream esp-hosted-mcu/slave but
-                         pulls in esp_ptp_rpc + chains our defaults
-    main               → ~/Development/esp-hosted-mcu/slave/main
-                         (upstream slave firmware, unmodified)
-    partitions.esp32c6.csv
-                       → upstream partitions
-    components/
-      esp_ptp_rpc      → scrambletools/esp_ptp_rpc repo (Github)
+                         pulls in esp_ptp_rpc + chains our defaults.
     sdkconfig.defaults   Coprocessor overrides
-                         (CONFIG_PTP_RPC_BUILD_COPROCESSOR_HANDLER=y)
+                         (CONFIG_PTP_RPC_BUILD_COPROCESSOR_HANDLER=y).
 ```
 
-The seven symlinks above must exist for the project to build. If you
-cloned via the parent dev tree they're already in place; if you cloned
-the bridge in isolation, create them pointing at your local checkouts
-of `esp_avb`, `esp_ptp`, `esp_ptp_rpc`, and the
-[`esp-hosted-mcu`](https://github.com/espressif/esp-hosted-mcu) clone.
+No manual setup is required for the host build — the AVB / gPTP /
+RPC components are managed dependencies and idf.py installs them
+into `managed_components/` automatically on first build. The
+coprocessor build has one additional prerequisite (cloning upstream
+`esp-hosted-mcu` source); see *Building and flashing* below.
 
 ## Building and flashing
 
@@ -105,11 +98,39 @@ once both sides are in place.
 
 ### 1. Coprocessor (C6) firmware
 
-Build root: `coprocessor/`. Flash via the C6's debug UART on the H7
-header (auto-reset wired).
+The coprocessor runs Espressif's upstream ESP-Hosted slave firmware
+overlaid with the `esp_ptp_rpc` handler. The slave is not distributed
+as a registry component (it's its own project mounted via local
+symlinks), so a one-time setup script fetches it and wires the
+symlinks in:
 
 ```
-cd ESP-AVB-Bridge
+./setup-coprocessor.sh
+```
+
+By default the script clones the upstream source into `./.deps/`
+(gitignored). To point at a pre-existing checkout instead, override
+via env var:
+
+```
+ESP_HOSTED_MCU_DIR=~/src/esp-hosted-mcu ./setup-coprocessor.sh
+```
+
+The script is idempotent — re-running it just refreshes the symlinks.
+
+`esp_ptp_rpc` is a registry component. The stub manifest at
+`coprocessor/components/registry_deps/` declares it so the IDF
+Component Manager pulls it into `managed_components/` automatically
+on first build. (The stub exists because the coprocessor's `main/`
+is symlinked to upstream `slave/main` and we can't add a manifest
+there.) Developers working on `esp_ptp_rpc` locally can place a
+symlink at `coprocessor/components/esp_ptp_rpc` — that path is
+gitignored and takes precedence over the managed copy.
+
+Build and flash via the C6's debug UART on the H7 header (auto-reset
+wired):
+
+```
 idf.py -C coprocessor set-target esp32c6
 idf.py -C coprocessor build
 idf.py -C coprocessor -p /dev/<serial-device> flash

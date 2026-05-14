@@ -16,6 +16,7 @@
  * extend functionality from the host side rather than fork it.
  */
 
+#include "avbbridge.h"
 #include "esp_avb.h"
 #include "esp_eth_clock.h"
 #include <driver/gpio.h>
@@ -26,13 +27,13 @@
 #include <esp_intr_alloc.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_ptp.h>
 #include <esp_vfs_l2tap.h>
 #include <esp_wifi.h>
 #include <ethernet_init.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <nvs_flash.h>
-#include <ptpd.h>
 #include <sdkconfig.h>
 #include <string.h>
 
@@ -57,16 +58,37 @@ static void on_ap_start(void *arg, esp_event_base_t base, int32_t id,
   }
 }
 
+/* SoftAP STA-association count, kept in sync with esp_avb via
+ * avb_bridge_set_wifi_ap_sta_count(). esp_avb's MRP LeaveAll
+ * suppression reads it back to skip the periodic burst while no
+ * client is listening. esp_event handlers run serialised so the
+ * counter doesn't need atomicity beyond what `volatile` provides. */
+static volatile unsigned int s_ap_sta_count = 0;
+static void on_ap_sta_connected(void *arg, esp_event_base_t base, int32_t id,
+                                void *data) {
+  (void)arg; (void)base; (void)id; (void)data;
+  s_ap_sta_count++;
+  avb_bridge_set_wifi_ap_sta_count(s_ap_sta_count);
+  ESP_LOGI(TAG, "AP STA associated; count=%u", s_ap_sta_count);
+}
+static void on_ap_sta_disconnected(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data) {
+  (void)arg; (void)base; (void)id; (void)data;
+  if (s_ap_sta_count > 0) s_ap_sta_count--;
+  avb_bridge_set_wifi_ap_sta_count(s_ap_sta_count);
+  ESP_LOGI(TAG, "AP STA disassociated; count=%u", s_ap_sta_count);
+}
+
 /* SoftAP defaults. Open auth for initial proof-of-concept;
  * encrypted Wi-Fi (WPA2/3) is in the plan. */
 #define AVB_AP_SSID "ESP-AVB-Bridge"
 #define AVB_AP_CHANNEL 6
 #define AVB_AP_MAX_CONN 4
 /* Beacon interval — TUs of 1024 µs. 100 TU = 102.4 ms, the spec
- * default. IEEE 802.1AS-2020 §12.8.2 prefers ~125 ms (logSyncInterval
- * = -3) for gPTP over Wi-Fi; ESP-IDF documents beacon_interval in
- * multiples of 100, so we accept the small mismatch for Phase 4 and
- * revisit cadence in Phase 7 once we measure beacon-IE jitter. */
+ * default. IEEE 802.1AS-2020 §12.8.2 prefers ~125 ms
+ * (logSyncInterval = -3) for gPTP over Wi-Fi; ESP-IDF documents
+ * beacon_interval in multiples of 100, so we accept the small
+ * mismatch. May revisit once beacon-IE jitter is measured. */
 #define AVB_AP_BEACON_INTERVAL 100
 
 static void init_ethernet_and_netif(void) {
@@ -178,6 +200,11 @@ static void init_wifi_softap(void) {
   s_ap_started = xSemaphoreCreateBinary();
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,
                                              on_ap_start, NULL));
+  /* Long-lived STA-count handlers — feed esp_avb's LeaveAll suppression. */
+  ESP_ERROR_CHECK(esp_event_handler_register(
+      WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, on_ap_sta_connected, NULL));
+  ESP_ERROR_CHECK(esp_event_handler_register(
+      WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, on_ap_sta_disconnected, NULL));
   ESP_ERROR_CHECK(esp_wifi_start());
   if (xSemaphoreTake(s_ap_started, pdMS_TO_TICKS(5000)) != pdTRUE) {
     ESP_LOGW(TAG, "Wi-Fi AP_START event did not fire within 5s; "
@@ -234,10 +261,11 @@ void app_main(void) {
   avb_start(&avb_config);
 
   /* Beacon-IE publish is fully owned by esp_ptp: when
-   * CONFIG_ESP_PTP_HAS_WIFI_CP_AP is set, esp_ptp's ptp_beacon_ie.c installs a
-   * WIFI_EVENT_AP_START handler at startup and dispatches SET_VENDOR_IE_REQ the
-   * moment the SoftAP comes up. Nothing for this host to do — it just brings up
-   * the SoftAP. */
+   * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR is set (i.e. any port has
+   * medium=wifi + host_if=sdio|spi + wifi_mode=ap), esp_ptp's
+   * ptp_beacon_ie.c installs a WIFI_EVENT_AP_START handler at startup
+   * and dispatches SET_VENDOR_IE_REQ the moment the SoftAP comes up.
+   * Nothing for this host to do — it just brings up the SoftAP. */
 
   ESP_LOGI(TAG, "AVB bridge up — Ethernet + Wi-Fi AP, L2 forwarder armed");
 

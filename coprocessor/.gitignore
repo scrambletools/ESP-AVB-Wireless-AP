@@ -1,0 +1,11 @@
+build/
+components/esp_*
+managed_components/
+reference/
+releases/
+main/
+*.lock
+sdkconfig
+.DS_Store
+*.old
+sdkconfig.old

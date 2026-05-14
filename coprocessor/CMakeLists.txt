@@ -44,8 +44,14 @@ set(SDKCONFIG_DEFAULTS
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 list(APPEND EXCLUDE_COMPONENTS lwip esp_netif)
 
-# Upstream's COMPONENTS allowlist + our esp_ptp_rpc.
-set(COMPONENTS esp_timer esptool_py bootloader main nvs_flash esp_rom esp_wifi protocomm driver mqtt wpa_supplicant wifi_provisioning esp_driver_sdio esp_pm openthread esp_ptp_rpc)
+# Upstream's COMPONENTS allowlist + our esp_ptp_rpc + registry_deps.
+# registry_deps is the stub component that hosts the idf_component.yml
+# declaring scrambletools/esp_ptp_rpc as a managed dependency, since
+# upstream slave/main (our `main`) can't be modified. esp_ptp_rpc is
+# also listed so it survives the allowlist filter regardless of
+# whether it resolves to managed_components/ (registry) or
+# components/esp_ptp_rpc/ (developer override symlink).
+set(COMPONENTS esp_timer esptool_py bootloader main nvs_flash esp_rom esp_wifi protocomm driver mqtt wpa_supplicant wifi_provisioning esp_driver_sdio esp_pm openthread esp_ptp_rpc registry_deps)
 
 project(network_adapter)
 idf_build_set_property(COMPILE_OPTIONS "-fdiagnostics-color=always" APPEND)

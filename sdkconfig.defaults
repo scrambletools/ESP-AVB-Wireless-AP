@@ -27,16 +27,21 @@ CONFIG_EXAMPLE_ETH_PHY_IP101=y
 # Per-port topology — esp_ptp is the single source of truth. The
 # matching ESP_AVB_* mirrors (NUM_PORTS, PORTn_MEDIUM_*, ROLE_BRIDGE,
 # etc.) are derived in esp_avb/Kconfig.projbuild and follow these.
-#   port 0: ethernet, bridged
-#   port 1: wifi_cp (Wi-Fi via ESP-Hosted to onboard C6), bridged, AP role
+#   port 0: ethernet  (host_if=emac, bridged, 1 Gbps)
+#   port 1: wifi      (host_if=sdio — onboard C6 over ESP-Hosted,
+#                      bridged, AP, ~150 Mbps negotiated cap)
 # Peer-delay on port 1 comes from 802.11 FTM (external); the AP also
 # publishes gPTP FollowUpInformation via beacon Vendor IE.
 CONFIG_ESP_PTP_NUM_PORTS=2
 CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET=y
+CONFIG_ESP_PTP_PORT0_HOST_IF_EMAC=y
 CONFIG_ESP_PTP_PORT0_TYPE_BRIDGED=y
-CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_CP=y
+CONFIG_ESP_PTP_PORT0_LINK_SPEED_MBPS=1000
+CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI=y
+CONFIG_ESP_PTP_PORT1_HOST_IF_SDIO=y
 CONFIG_ESP_PTP_PORT1_TYPE_BRIDGED=y
-CONFIG_ESP_PTP_PORT1_WIFI_ROLE_AP=y
+CONFIG_ESP_PTP_PORT1_WIFI_MODE_AP=y
+CONFIG_ESP_PTP_PORT1_LINK_SPEED_MBPS=150
 
 # gPTP intervals matching the example.
 CONFIG_NETUTILS_PTPD_PRIORITY1=246

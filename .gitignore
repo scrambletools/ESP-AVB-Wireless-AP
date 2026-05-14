@@ -2,6 +2,17 @@ build/
 build.clang/
 components/esp_*
 managed_components/
+
+# Coprocessor build dependencies (provided by setup-coprocessor.sh).
+# Both the upstream esp-hosted-mcu source tree and the symlinks that
+# mount it into the coprocessor build live outside of git so the
+# repo doesn't ship paths that assume any external directory layout.
+/.deps/
+/common
+/coprocessor/main
+/coprocessor/partitions.esp32c6.csv
+/coprocessor/components/esp_*
+
 reference/
 releases/
 .vscode/

@@ -1,0 +1,2 @@
+dependencies:
+  scrambletools/esp_ptp_rpc: "*"
