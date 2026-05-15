@@ -12,3 +12,9 @@ CONFIG_PTP_RPC_BUILD_COPROCESSOR_HANDLER=y
 # rebuilding. Drop these once Phase 8 stabilizes.
 CONFIG_BOOTLOADER_LOG_LEVEL_VERBOSE=y
 CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+
+# FTM: responder on the SoftAP per IEEE 802.1AS-2020 §12.1.2. STAs
+# initiate FTM bursts against the AP; this side must respond.
+# Required so the STA's ptpd_inject_peer_delay path gets RTT samples.
+CONFIG_ESP_WIFI_FTM_ENABLE=y
+CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT=y

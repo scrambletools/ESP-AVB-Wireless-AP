@@ -19,6 +19,7 @@ releases/
 .claude/
 .codex
 AGENTS.md
+project.md
 *.lock
 sdkconfig
 .DS_Store

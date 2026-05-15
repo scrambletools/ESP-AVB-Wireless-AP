@@ -223,13 +223,26 @@ void app_main(void) {
   init_ethernet_and_netif();
   ESP_LOGI(TAG, "Ethernet started");
 
-  ptpd_start(s_avb_eth_interface);
+  /* Start ptpd on the wired side first (port 0 = eth_hwts). This
+   * spawns the daemon task and opens the L2TAP socket; once
+   * CLOCK_PTP_SYSTEM is readable below, ptp_initialize_state has
+   * finished and the daemon is in its main loop. */
+  ptpd_start_port(0, s_avb_eth_interface, ptp_port_medium_eth_hwts);
 
   while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
   init_wifi_softap();
+
+  /* Attach the Wi-Fi port to the running daemon (port 1 = wifi_ftm,
+   * SoftAP). No socket opens; Sync transport is the SoftAP's 802.11
+   * Beacon Vendor IE driven by the sync_egress_cb registered by
+   * esp_ptp/ptp_beacon_ie.c on WIFI_EVENT_AP_START. The daemon's
+   * periodic-send loop fires the callback at the configured gPTP
+   * Sync interval; peer-delay on this port is FTM-driven (none on
+   * the AP side — STAs initiate FTM toward us). */
+  ptpd_start_port(1, "WIFI_0", ptp_port_medium_wifi_ftm);
 
   /* AVB stack — bridge role. NUM_PORTS=2: port[0]=Ethernet (EMAC),
    * port[1]=Wi-Fi AP (over esp_wifi_remote → onboard C6). The L2
@@ -260,12 +273,13 @@ void app_main(void) {
 
   avb_start(&avb_config);
 
-  /* Beacon-IE publish is fully owned by esp_ptp: when
-   * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR is set (i.e. any port has
-   * medium=wifi + host_if=sdio|spi + wifi_mode=ap), esp_ptp's
-   * ptp_beacon_ie.c installs a WIFI_EVENT_AP_START handler at startup
-   * and dispatches SET_VENDOR_IE_REQ the moment the SoftAP comes up.
-   * Nothing for this host to do — it just brings up the SoftAP. */
+  /* Beacon-IE publish is fully owned by esp_ptp. The daemon's
+   * periodic-send loop fires the sync_egress_cb on the wifi_ftm port
+   * at the gPTP Sync interval; esp_ptp/ptp_beacon_ie.c registers the
+   * callback on WIFI_EVENT_AP_START and packs the daemon-marshalled
+   * FollowUpInformation bytes into a Vendor IE for the coprocessor
+   * to set via esp_wifi_set_vendor_ie(). Nothing for this host to do
+   * past bringing up the SoftAP and attaching port 1 above. */
 
   ESP_LOGI(TAG, "AVB bridge up — Ethernet + Wi-Fi AP, L2 forwarder armed");
 
