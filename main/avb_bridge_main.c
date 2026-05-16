@@ -139,9 +139,22 @@ static void init_ethernet_and_netif(void) {
 
 /* Bring up the SoftAP via esp_wifi_remote (transparent SDIO RPC to
  * the onboard coprocessor). The first esp_wifi_init call drives the
- * SDIO host-coprocessor handshake; if the coprocessor hasn't been
- * flashed with the ESP-Hosted firmware this will fail at boot */
-static void init_wifi_softap(void) {
+ * SDIO host-coprocessor handshake; if the coprocessor is unreachable
+ * (wedged / firmware mismatch / cable issue) any of these esp_wifi_*
+ * RPCs can return failure. We DON'T ESP_ERROR_CHECK them — an abort
+ * here would put the P4 into a reboot loop. Instead we propagate the
+ * error to app_main, which drops into wired-only degraded mode. */
+#define WIFI_CHECK(call, what)                                                 \
+  do {                                                                         \
+    esp_err_t _e = (call);                                                     \
+    if (_e != ESP_OK) {                                                        \
+      ESP_LOGE(TAG, "%s failed (%s) — coprocessor unreachable; "               \
+                    "bridge will run wired-only",                              \
+               (what), esp_err_to_name(_e));                                   \
+      return _e;                                                               \
+    }                                                                          \
+  } while (0)
+static esp_err_t init_wifi_softap(void) {
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
       ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -162,11 +175,12 @@ static void init_wifi_softap(void) {
   ap_inherent.if_key = "WIFI_0";
   ap_inherent.if_desc = "wifi0";
   s_wifi_ap_netif = esp_netif_create_wifi(WIFI_IF_AP, &ap_inherent);
-  ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
+  WIFI_CHECK(esp_wifi_set_default_wifi_ap_handlers(),
+             "esp_wifi_set_default_wifi_ap_handlers");
 
   wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+  WIFI_CHECK(esp_wifi_init(&wcfg), "esp_wifi_init");
+  WIFI_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM), "esp_wifi_set_storage");
 
   wifi_config_t wifi_cfg = {
       .ap =
@@ -185,13 +199,13 @@ static void init_wifi_softap(void) {
           },
   };
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg));
+  WIFI_CHECK(esp_wifi_set_mode(WIFI_MODE_AP), "esp_wifi_set_mode");
+  WIFI_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg), "esp_wifi_set_config");
   /* Power save off on the AP — required for predictable beacon
    * timing once we start publishing FollowUpInformation in the
    * beacon Vendor IE. Leaving it off from boot avoids a
    * later runtime toggle. */
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+  WIFI_CHECK(esp_wifi_set_ps(WIFI_PS_NONE), "esp_wifi_set_ps");
 
   /* Set up the AP_START gate before esp_wifi_start so we don't miss
    * the event. esp_avb's port[1] init reads the netif MAC immediately;
@@ -205,7 +219,7 @@ static void init_wifi_softap(void) {
       WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, on_ap_sta_connected, NULL));
   ESP_ERROR_CHECK(esp_event_handler_register(
       WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, on_ap_sta_disconnected, NULL));
-  ESP_ERROR_CHECK(esp_wifi_start());
+  WIFI_CHECK(esp_wifi_start(), "esp_wifi_start");
   if (xSemaphoreTake(s_ap_started, pdMS_TO_TICKS(5000)) != pdTRUE) {
     ESP_LOGW(TAG, "Wi-Fi AP_START event did not fire within 5s; "
                   "port[1] MAC may be zero");
@@ -215,7 +229,9 @@ static void init_wifi_softap(void) {
   ESP_LOGI(TAG, "Wi-Fi SoftAP up: SSID='%s' ch=%d beacon=%d TU max_conn=%d",
            AVB_AP_SSID, AVB_AP_CHANNEL, AVB_AP_BEACON_INTERVAL,
            AVB_AP_MAX_CONN);
+  return ESP_OK;
 }
+#undef WIFI_CHECK
 
 void app_main(void) {
   struct timespec cur_time;
@@ -233,7 +249,22 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
-  init_wifi_softap();
+  esp_err_t wifi_rc = init_wifi_softap();
+  if (wifi_rc != ESP_OK) {
+    /* Coprocessor / SDIO failed. Wired ptpd (started above on port 0)
+     * keeps running in its own task; we just park app_main here so the
+     * P4 stays alive instead of cascading into a reboot. Recovery
+     * requires a real C6 reset — see AGENTS.md for the manual
+     * procedure. */
+    ESP_LOGW(TAG, "Bridge entering wired-only degraded mode "
+                  "(Wi-Fi init returned %s). Wired ptpd continues on "
+                  "port 0; AVB stack is NOT started.",
+             esp_err_to_name(wifi_rc));
+    while (1) {
+      vTaskDelay(pdMS_TO_TICKS(30000));
+      ESP_LOGW(TAG, "heartbeat (degraded, wired ETH + ptpd only)");
+    }
+  }
 
   /* Attach the Wi-Fi port to the running daemon (port 1 = wifi_ftm,
    * SoftAP). No socket opens; Sync transport is the SoftAP's 802.11
