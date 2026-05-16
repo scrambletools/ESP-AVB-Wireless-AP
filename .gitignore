@@ -20,6 +20,7 @@ releases/
 .codex
 AGENTS.md
 project.md
+espressif.md
 *.lock
 sdkconfig
 .DS_Store
