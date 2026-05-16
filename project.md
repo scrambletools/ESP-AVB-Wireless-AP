@@ -33,7 +33,7 @@ publisher.
 | ATDECC CLASS_B flag honoring (endpoint side) | working — first listener wins the class on talker, `talker_exclusive` rejects mismatch |
 | Bridge forwarding observability | working — heartbeat reports `fwd eth=X/Y wifi=A/B oom=Z STA=N` every 5 s |
 | gPTP — wired side (port 0) | working — ptpd locks to MOTU AVB switch BTC, ±40 ns offset |
-| gPTP — Wi-Fi side (port 1) | **not implemented** — design captured below (Beacon-IE FollowUpInformation + FTM peer delay). Wi-Fi listeners currently declare themselves BTC. |
+| gPTP — Wi-Fi side (port 1) | working — beacon-IE §12.7 + FTM-derived sync pair via a companion Scramble Tools TSF mapping IE. STA converts FTM hardware-timestamped `t1` to GM time via the (gPTP, AP-TSF) mapping and feeds the daemon through `ptpd_inject_sync_pair`. Median ESP3 wireless offset ~14 µs (vs wired ~33 ns baseline). Milan §5.6 strict (<500 ns Class A) blocked on IDF exposing FTM-action-frame Vendor IE — see `espressif.md`. |
 
 ## What's implemented
 
@@ -86,13 +86,43 @@ implementation parks the IE in the SoftAP's **Beacon** Vendor IE
 instead. The reason: ESP-IDF's public Wi-Fi API
 (`esp_wifi_set_vendor_ie()`) only addresses the Beacon/ProbeResp
 Vendor IE slots; the FTM responder Vendor IE is not exposed by the
-host-side API or by `esp_wifi_remote`. The byte format of the IE is
-exactly the §12.7 spec; only the carrier frame type changes. The
-practical cost: timing precision is bounded by beacon TX jitter
-(roughly the beacon interval, ~100 ms) rather than the much tighter
-FTM round-trip timestamps that §12.1.2 was designed around. Revisit
-if/when IDF exposes the FTM responder IE — the carrier swap is
-wire-compatible by design.
+host-side API or by `esp_wifi_remote`. The byte format of the §12.7
+IE is exactly the spec; only the carrier frame type changes. The
+beacon carrier alone is bounded by beacon TX jitter (≈100 ms) and
+the host→coprocessor→TX→air pipeline; with no further mechanism we'd
+get only ~50–100 ms phase accuracy. See `espressif.md` in this repo
+for the API additions we'd want from IDF to land spec-compliant
+§12.7-in-FTM, and the precision improvements they'd unlock.
+
+**Companion Scramble Tools TSF mapping IE.** To recover most of the
+precision the spec carrier was designed for, the bridge publishes a
+**second** Vendor IE in the same beacon — Scramble-Tools-private
+sub-OUI type `0x01`, payload `uint64 µs LE` carrying the bridge's
+wifi MAC TSF at coprocessor-publish moment. The host marshals the
+template with zeros; the coprocessor's RPC handler reads
+`esp_wifi_get_tsf_time(WIFI_IF_AP)` and patches the payload in
+immediately before the beacon goes out, so the captured TSF is as
+close as possible to the actual beacon TX moment.
+
+The STA parses both IEs and stores `(gPTP_marker_ns,
+ap_tsf_marker_us)` as a running pair. When `WIFI_EVENT_FTM_REPORT`
+fires (FTM session is initiated separately by the STA against the
+bridge's FTM responder), the handler converts the responder's
+hardware-timestamped `entries[best].t1` (in bridge TSF pSec) to GM
+time via the mapping: `t1_gPTP_ns = gPTP_marker + (t1_us −
+ap_tsf_marker) × 1000`. It back-projects the STA local clock to the
+FTM RX moment using `entries[best].t2` plus `esp_timer`, and feeds
+the pair into the new `ptpd_inject_sync_pair(port, remote_ns,
+local_ns)` API. From there the normal PI servo runs (now exercising
+the SW clock backend for non-EMAC builds — see Phase 3 below).
+
+This architecture preserves the §12.7 IE byte format unchanged
+(byte-format compliant; a standards-aware parser sees it untouched)
+and confines the deviation to two things: the carrier (beacon vs
+TM/FTM action frame, same as before) and a clearly-labeled
+vendor-private mapping IE alongside it. When IDF exposes the FTM
+responder Vendor IE slot we can drop the mapping IE entirely and
+move both pieces into the FTM action frame.
 
 ```
    wired BTC              ESP1 bridge (P4 + C6)               ESP3 (C6 STA)
@@ -173,40 +203,26 @@ Punch list — remaining work, in dependency order:
    is already PI-servo-corrected GM-time, so no residence-time
    accumulation is needed. Documented inline.
 
-5. ~~STA — FTM client~~ — **infrastructure done, measurement
-   blocked on hardware.** The FTM client task lives in
-   `ESP-AVB-Endpoint/main/avb_endpoint.c` (`ftm_client_task` +
-   `WIFI_EVENT_FTM_REPORT` handler); the bridge coprocessor has
-   `CONFIG_ESP_WIFI_FTM_ENABLE=y` and
-   `CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT=y`. `ptpd_inject_peer_delay`
-   is implemented and stores into `port->peer_delay_ns` via the same
-   running-average shape as the wired Pdelay path.
+5. ~~STA — FTM client~~ — **done.** Full FTM-derived sync pipeline
+   lands on the STA via the companion TSF mapping IE described in
+   the carrier-deviation section above. Median ESP3 wireless offset
+   to the wired BTC is **~14 µs** over 60+ sample observation (vs
+   ~72 ms steady-state on the beacon-IE-only path before).
+   `peer_delay_ns` is sourced from FTM per-entry rtt averaging
+   (pSec resolution) — not from the IDF aggregate `rtt_est` (which
+   truncates to 0 at bench distances).
 
-   At runtime the bridge does respond to the FTM Action frame
-   (`wifi:Starting FTM session with <bssid> in N mSec` log appears)
-   but every report returns `FTM_STATUS_NO_VALID_MSMT` (status=5).
-   Status semantics: the FTM handshake completed and frames were
-   exchanged (otherwise we'd get `FTM_STATUS_FAILURE`), but every
-   RTT sample in the burst was unusable. Root cause not yet
-   investigated on hardware; what we *have* verified:
-   - `.ap.ftm_responder = true` is set in the bridge's
-     `wifi_config_t.ap` at `init_wifi_softap()` (avb_bridge_main.c).
-   - ESP-Hosted RPCs the bit through to the C6
-     (`espressif__esp_hosted/host/drivers/rpc/core/rpc_req.c:378`).
-   - `CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT=y` on the coprocessor;
-     `CONFIG_ESP_WIFI_FTM_INITIATOR_SUPPORT=y` on the endpoint.
-   - Initiator cfg matches the IDF FTM example shape exactly
-     (`frm_count`, `burst_period`, `channel`, `resp_mac`).
+   Earlier instability (every report returning
+   `FTM_STATUS_NO_VALID_MSMT`) turned out to be transient; the
+   responder stabilises after a clean coprocessor cold-boot (per
+   `AGENTS.md` safe-reflash recipe). The diagnostic dump in the
+   failure branch of `WIFI_EVENT_FTM_REPORT` will surface per-entry
+   t1/t2/t3/t4 if the state recurs.
 
-   So today `peer_delay_ns` stays at 0, the static beacon-IE
-   pipeline bias (~24–50 ms) is uncompensated, and the STA clock
-   tracks to ±50 ms. Next investigation steps when the bias
-   matters: (a) log `ap_info.ftm_responder` on the endpoint before
-   initiating to confirm the AP advertises FTM in beacons,
-   (b) test against an FTM-capable commodity AP to isolate
-   bridge-side vs initiator-side, (c) move to the spec-aligned
-   §12.7 FTM Vendor IE carrier once IDF exposes the FTM responder
-   IE (eliminating the beacon-pipeline lag entirely).
+   The remaining gap to Milan §5.6 strict (<500 ns Class A) requires
+   the §12.7 IE to ride inside FTM Action frames so its preciseOrigin-
+   Timestamp shares the MAC-stamped t1 moment. That's blocked on
+   IDF API surface — see `espressif.md`.
 
 6. ~~STA — enable Wi-Fi medium ptpd on ESP-AVB-Endpoint~~ —
    **done.** `start_wifi_endpoint()` in `avb_endpoint.c` now calls
@@ -215,20 +231,44 @@ Punch list — remaining work, in dependency order:
    are gated on having an `eth_hwts` port with an open socket, so
    wifi-only endpoints don't spam EBADF.
 
-7. **OUI registration (operational)**. Locally-administered
-   `02:00:00` is fine for the development bench but collides with
-   anyone else doing the same. Either obtain a Scramble Tools OUI
-   from IEEE or coordinate with Espressif on a type code under
-   theirs. Non-blocking for bring-up; required before distribution.
+7. ~~OUI registration~~ — **done.** Vendor IEs use the Scramble
+   Tools IEEE-registered MA-L prefix `8C:1F:64` (24-bit OUI of the
+   MA-S OUI `0x8C1F6436C`; see `Development/profiles/avb_lite.md`).
+   Constants live in `esp_ptp_rpc/include/ptp_rpc_proto.h` so the
+   marshaller, coprocessor handler, and STA parser stay in sync.
 
-8. **STA-side servo audit**. With Sync arriving on the ~100 ms
-   beacon cadence (10 Hz) instead of the wired ~8 Hz, plus the
-   wider peer-delay variance from FTM, the existing ptpd servo
-   gains may need a Wi-Fi-specific tuning block. Verify lock +
-   standard deviation on a 30-minute soak before declaring done.
+8. ~~STA-side servo audit~~ — **partially done.** Found and fixed a
+   fundamental issue: `clock_adjtime(CLOCK_REALTIME, ADJ_FREQUENCY)`
+   on IDF is a no-op outside the EMAC PTP backend, so the freq
+   output of the wireless servo was being silently dropped. The
+   `ptp_clock_sw` backend existed but was never initialised; it now
+   is, gated on `!SOC_EMAC_SUPPORTED` in `ptp_initialize_state`,
+   and `ptp_gettime / ptp_settime / ptp_adjtime` + the freq-adjust
+   path in `ptp_lock_local_clock_freq` route through it. Also fixed
+   `ptp_clock_sw_adjtime_rate` to be a relative compound (matching
+   `emac_hal_ptp_adj_freq`) so the servo's relative `freq_ppb`
+   output composes correctly across PI iterations.
 
-Total remaining scope: items 5 (FTM client) + 7 (OUI) + 8 (servo
-audit) — ~120 LOC plus operational/measurement work.
+   Result: STA wireless median offset ~14 µs over 60+ samples;
+   max ~185 µs. Some outlier pair injections of ~-280 sec spikes
+   appear intermittently — ptpd absorbs them, but root cause is
+   not yet isolated. **Recommended follow-on**: 30-minute soak to
+   characterise the outlier rate and confirm no long-term drift
+   creep; investigate the outlier mechanism (suspected race in
+   marker pair capture across non-atomic IE arrivals).
+
+9. **Outlier pair injections.** ~5–10% of FTM reports produce a
+   pair-injection whose `t1_gPTP − local_RX` is ~280 sec off vs the
+   ms-scale norm. The servo's jump path absorbs them, so steady-
+   state offset stays in µs, but the cause should be tracked down.
+   Best guess so far: the dedup ordering on the §12.7 IE causes the
+   gPTP marker to be paired with a TSF marker from a different
+   sync interval. Marker update is now before dedup (`avb_endpoint.c`
+   `on_vendor_ie`) which eliminated most of the spread but not all.
+
+Total remaining scope: items 8/9 follow-on measurement work
+(servo soak + outlier root cause) + the upstream gating on items
+in `espressif.md` for Milan strict.
 
 What's done so far on the gPTP-over-Wi-Fi work:
 
@@ -269,6 +309,37 @@ What's done so far on the gPTP-over-Wi-Fi work:
 - ESP3 logs `inject_sync port=0: locked onto GM 0001f2fffeff3b14`
   (= MOTU AVB switch's MAC in EUI-64) and `Local time / remote
   time` deltas tracked by `ptp_update_local_clock`.
+
+**Phase 3 (FTM-derived sync precision)**
+- `ptp_clock_sw` backend wired in for non-EMAC builds — without
+  this the wireless servo's freq output was silently dropped by
+  IDF. `ptp_gettime / ptp_settime / ptp_adjtime` and the freq
+  adjust path all route through the SW backend when the daemon
+  detects `!SOC_EMAC_SUPPORTED`.
+- `ptp_clock_sw_adjtime_rate` corrected from absolute-set to
+  relative compound, matching the EMAC `clock_adjtime
+  ADJ_FREQUENCY` semantics the servo formula assumes.
+- New `ptpd_inject_sync_pair(port, remote_ns, local_ns)` API —
+  bypasses the §12.7 byte parser and feeds an FTM-derived pair
+  directly into `ptp_update_local_clock`.
+- Companion Scramble Tools TSF mapping IE (sub-OUI `0x01`)
+  published in slot 1 of each beacon alongside the §12.7 IE in
+  slot 0. Host marshals the template, coprocessor RPC handler
+  patches in `esp_wifi_get_tsf_time(WIFI_IF_AP)` at publish
+  time. Shared OUI / sub-OUI constants live in
+  `esp_ptp_rpc/include/ptp_rpc_proto.h`.
+- STA's `on_vendor_ie` parses both IEs and stores
+  `(gPTP_marker_ns, ap_tsf_marker_us)`; gPTP marker update is
+  before §12.7 dedup so the pair stays per-beacon-fresh.
+- STA's FTM success handler converts `entries[best].t1` (bridge
+  TSF pSec) to GM time via the mapping, back-projects local
+  clock to FTM RX moment via `entries[best].t2` + `esp_timer`,
+  and calls `ptpd_inject_sync_pair`. The original
+  `ptpd_inject_sync` from the beacon path still runs to
+  bootstrap `selected_source`.
+- Result: median ESP3 wireless offset **~14 µs** vs the ~72 ms
+  beacon-IE-only baseline (≈5000× improvement). Wired ESP2 at
+  ~33 ns median — unchanged.
 
 Validation plan:
 
