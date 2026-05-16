@@ -34,7 +34,8 @@ publisher.
 | Bridge forwarding observability | working — heartbeat reports `fwd eth=X/Y wifi=A/B oom=Z STA=N` every 5 s |
 | gPTP — wired side (port 0) | working — ptpd locks to MOTU AVB switch BTC, ±40 ns offset |
 | gPTP — Wi-Fi side (port 1) | working — beacon-IE §12.7 + FTM-derived sync pair via a companion Scramble Tools TSF mapping IE. STA converts FTM hardware-timestamped `t1` to GM time via the (gPTP, AP-TSF) mapping and feeds the daemon through `ptpd_inject_sync_pair`. Median ESP3 wireless offset ~14 µs (vs wired ~33 ns baseline). Milan §5.6 strict (<500 ns Class A) blocked on IDF exposing FTM-action-frame Vendor IE — see `espressif.md`. |
-| Bridge / coprocessor fault tolerance | working — three layered defenses against the cascade-reboot pattern that used to follow any SDIO hiccup: (1) `CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n` so a single SDIO timeout no longer calls `esp_restart()` on the P4, (2) `init_wifi_softap` returns failure instead of `ESP_ERROR_CHECK`-aborting if `esp_wifi_*` fails — app_main then parks in a wired-only degraded mode (wired ptpd keeps running, AVB stack skipped), (3) `CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y` so the GPIO 54 pulse only fires when SDIO card-init fails — verified across three P4-only reset trials that the slave gracefully re-handshakes via `ESP_PRIV_EVENT_INIT` without needing reset. Cold POWERON: 3-min uptime proven stable. Open: (a) GPIO 54 pulse appears not to actually reset the C6 (only matters in genuine-wedge case), (b) 3 transient "Dropping packet(s) from stream" warnings during post-reset re-handshake when the C6 has stale TX backlog — self-recovers in ~10 ms. |
+| Bridge / coprocessor fault tolerance | working — four layered defenses against the cascade-reboot pattern that used to follow any SDIO hiccup: (1) `CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n` so a single SDIO timeout no longer calls `esp_restart()` on the P4, (2) `init_wifi_softap` returns failure instead of `ESP_ERROR_CHECK`-aborting if `esp_wifi_*` fails — app_main then parks in a wired-only degraded mode (wired ptpd keeps running, AVB stack skipped), (3) `CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y` so the GPIO 54 pulse only fires when SDIO card-init fails, (4) `CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE=n` so the "no INIT within timeout" timer no longer self-restarts the P4 when a still-running C6 doesn't re-emit `ESP_PRIV_EVENT_INIT`. Cold POWERON: 3-min uptime proven stable. Open: (a) GPIO 54 pulse appears not to actually reset the C6 (only matters in genuine-wedge case), (b) 3 transient "Dropping packet(s) from stream" warnings during post-reset re-handshake when the C6 has stale TX backlog — self-recovers in ~10 ms. |
+| End-to-end audio streaming | **not yet working** — ATDECC ACMP `CONNECT_TX` / `CONNECT_RX` succeed end-to-end across the bridge (verified with `avb_controller.py connect --class-b` between ESP2 (wired talker) and ESP3 (wireless listener)) and `stream-info` reports both sides Connected with Class=B, MSRP-Fail=0, Talker-Failed=False, Streaming-Wait=False. But `Acc Latency` stays at 0 ns on both sides and **0 stream frames appear on the wire** during a held connect. Root cause localized by tap: ESP2 emits 9 non-MSRP frames per 15 s (ATDECC responses etc.) but **zero MSRP frames** even during a held Class B connect, so its TalkerAdvertise never goes out — bridge MAP and ESP3 listener never see anything to propagate. Listener Ready can't come back. Bug is in ESP2's MSRP-emission path for the post-CONNECT_TX case. Class A path on wired↔wired could theoretically work but is rejected by bridge MAP for Class A → Wi-Fi (by design — `Bridge MAP §35.2.4.3`). See "End-to-end streaming debug" in `What's left`. |
 
 ## What's implemented
 
@@ -61,6 +62,103 @@ Concise reference for "where does X live?" — section markers in
 | `ESP-AVB-Bridge/coprocessor/` | C6 firmware = ESP-Hosted network_adapter + custom-RPC handler. |
 
 ## What's left
+
+### End-to-end streaming debug (active)
+
+**Problem:** Across-bridge streaming doesn't actually carry AVTP frames
+even after a successful ACMP connect. ATDECC and the bridge fault-
+tolerance work are clean; the gap is in MSRP TalkerAdvertise emission
+on the talker side.
+
+**Test fixture (2026-05-16):**
+- ESP2 (wired endpoint, P4-ETH, MAC `e8:f6:0a:e0:92:20`) has onboard
+  ES8311 codec — works, "Codec configured and enabled (ADC+DAC active)".
+- ESP3 (wireless endpoint, C6 + onboard ES8311) — codec enable just
+  landed in `ESP-AVB-Endpoint d897ee6`. Pins MCLK=19/BCLK=20/WS=22/
+  DOUT=21/DIN=23/SDA=8/SCL=7/PA=6 per `esp_avb/avbconfig.h` comment
+  block. One warning to investigate later: `PLL init failed (sample
+  clock will free-run)` — ADC/DAC active but sample clock isn't
+  locked to MCLK, will drift.
+- Bridge wired MAC is actually `80:f1:b2:d2:ca:a9`. Earlier AGENTS.md
+  values containing `:e0` are stale.
+- Tap mapping (verified live with `dumpcap -i ... -a duration:N`):
+  `enp2s0f0` mixed/SPAN-like; `enp2s0f1` sees ESP2 (its own TX) +
+  switch broadcasts; `enp2s0f2` sees bridge TX + bridge-forwarded
+  ESP3 traffic. Bridge AGENTS.md and endpoint AGENTS.md tap mappings
+  disagree — both have stale fragments; current setup matches "ESP2
+  upstream / ESP2 downstream / bridge upstream" semantics roughly but
+  isn't perfectly directional.
+
+**Tooling gotcha (don't re-stumble on this):** `tshark -Q` suppresses
+per-packet output entirely, so anything counting with `tshark -Q | wc -l`
+returns 0 even when frames are flying. Use `dumpcap -i IFACE -a
+duration:N -w /tmp/x.pcap` then dissect offline with `tshark -r
+/tmp/x.pcap -Y 'filter' -T fields -e ...`. Piped `tshark | head -N` is
+also unreliable because tshark buffers stdout — when the wrapping
+`timeout` fires SIGTERM the buffer can be lost.
+
+**Observation from controller `stream-info` during a held
+`avb_controller.py connect --class-b $ESP2 $ESP3`:**
+- ESP2 `STREAM OUTPUT[0]`: Connected=True, Class=B, Talker-Failed=False,
+  Streaming-Wait=False, MSRP-Fail=0, **Acc-Latency=0 ns** (should be ~µs)
+- ESP3 `STREAM INPUT[0]`: Connected=True, Class=B, Talker-Failed=False,
+  Streaming-Wait=False, MSRP-Fail=0, **Acc-Latency=0 ns**
+- ATDECC reports SUCCESS on both `CONNECT_TX_RESPONSE` and
+  `CONNECT_RX_RESPONSE`.
+- Format mismatch (ESP2 = `AAF 48k 24bit 8ch`, ESP3 = `AM824 48k DBS=8`)
+  is harmless for testing the data plane and not the gating issue.
+
+**Observation from 15 s `dumpcap` covering the held connect:**
+
+| Tap | Total | MSRP (0x22ea) breakdown |
+|---|---|---|
+| `enp2s0f1` (ESP2 side) | 67 | 6 from MOTU switch (00:01:f2:ff:3b:14), **0 from ESP2** |
+| `enp2s0f2` (bridge side) | 79 | 15 from bridge, **0 from ESP3** |
+
+ESP2 emits 9 non-MSRP frames in the same window (ATDECC replies etc.)
+so it's plainly capable of egress — it's specifically MSRP that's
+silent. ESP3 emits 13 non-MSRP frames forwarded by the bridge to the
+wired side, so the bridge's wifi→wired forwarder works.
+
+**Conclusion:** the talker-side `mrp.c` doesn't emit a MSRP
+TalkerAdvertise after ACMP `CONNECT_TX_COMMAND` flips
+`stream_info_flags.class_b = 1` for stream `OUTPUT[0]`. Without
+TalkerAdvertise the bridge MAP has nothing to propagate to the wifi
+side, ESP3's listener has nothing to subscribe to with ListenerReady,
+the talker never sees Listener Ready and stays in "configured but not
+transmitting" state — explains the 0-byte `Acc Latency` on both
+sides and the 0-frame wire.
+
+**Next steps to debug:**
+
+1. Look at `esp_avb/mrp.c` (section markers `§1/§1b/§6/§6a/§6b/§6c/§7/
+   §8` in the header) to find where MSRP TalkerAdvertise is supposed
+   to register for stream `OUTPUT[i]` when ACMP flips a connection
+   live. Compare the post-CONNECT_TX path against the boot-time
+   talker-declare path that fires `mrp_declare_talker` from
+   `avb.c:780` ish.
+2. Check whether the per-stream `mapping_index = info_flags.class_b ?
+   1 : 0` is consulted by the MRP send path (see `avb.c:560,584,4102`
+   for callers that already use it).
+3. The wired-AVB-switch (MOTU) does emit MSRP on `enp2s0f1` even when
+   we're not connecting, which means MSRP is reaching ESP2's NIC; if
+   ESP2's MRP send path were stuck on TX failure we'd see retry logs.
+4. Useful single-shot diagnostic test: `dumpcap -i enp2s0f1 -a
+   duration:15 -w /tmp/f1.pcap` + open the connect from the same
+   shell + `tshark -r /tmp/f1.pcap -Y 'eth.type==0x22ea or
+   vlan.etype==0x22ea' -V` to see actual MRP PDU bytes.
+5. The bridge MAP also rejects Class A → Wi-Fi by design
+   (`Bridge MAP §35.2.4.3`), so always test with `--class-b`.
+   `avb_controller.py connect --class-b` sets ACMP flags bit 15 per
+   IEEE 1722.1-2021 §8.2.1.16 Table 8-4; ESP2 correctly switches
+   `stream_info_flags.class_b` to 1 in response (verified via
+   `stream-info` showing Class=B post-connect).
+
+**Out of scope for this work** (deferred):
+- ESP3 PLL init failure (sample clock free-runs — audio will drift)
+- Format negotiation between talker (AAF) and listener (AM824)
+- GPIO 54 actually-doesn't-reset-C6 issue (only matters when C6
+  genuinely wedges, see "Bridge / coprocessor fault tolerance")
 
 ### Critical — required for full bridge functionality
 
