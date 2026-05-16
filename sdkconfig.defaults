@@ -111,6 +111,15 @@ CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n
 # CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP is not set
 CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 
+# Also disable the "host restarts itself if slave never sends INIT" path.
+# With RESET_ONLY_IF_NECESSARY, if the C6 is alive but didn't see the
+# P4 go away (so it doesn't re-emit ESP_PRIV_EVENT_INIT) the host would
+# otherwise hit this timeout and call esp_restart() — putting the P4
+# back into the same cascade we already disabled. With this off the
+# timeout fires harmlessly (logged), then esp_wifi_init returns ESP_FAIL
+# and our init_wifi_softap graceful path drops into wired-only mode.
+# CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE is not set
+
 # FreeRTOS / EMAC settings cloned from the example.
 CONFIG_FREERTOS_ISR_STACKSIZE=6144
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
