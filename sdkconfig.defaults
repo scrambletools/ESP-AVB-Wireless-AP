@@ -128,6 +128,25 @@ CONFIG_ETH_TRANSMIT_MUTEX=n
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 CONFIG_ETH_IRAM_OPTIMIZATION=y
+# Bumped from 30 to 64 to absorb Class A AVTP bursts (8000 pps) while
+# the bridge RX task drains; 30 overflowed under load.
 CONFIG_ETH_DMA_RX_BUFFER_NUM=30
 CONFIG_ESP_NETIF_L2_TAP_RX_QUEUE_SIZE=64
 CONFIG_ETH_DMA_BUFFER_SIZE=1536
+# Bridge Wi-Fi TX path tuning for AVTP forwarding.
+# - More TX buffers absorb burst arrivals before the aggregator
+#   sends them out.
+# - A wide Block-Ack window lets A-MPDU pack many AVTP frames into
+#   one PHY transmission, which is what makes high-rate streams
+#   fit on 802.11.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+# Max BA window for HT/HE — packs up to 64 frames into one A-MPDU,
+# amortising 802.11 per-frame overhead. Chip supports HE so the
+# Kconfig range is 2..64; pre-Wi-Fi-6 silicon caps at 32.
+CONFIG_ESP_WIFI_TX_BA_WIN=64
+# Pin the Wi-Fi work to CPU1. EMAC RX runs at high priority on CPU0
+# (where the IDF emac_esp32_rx_task drains the DMA ring); moving the
+# Wi-Fi MAC/TX work off CPU0 keeps EMAC RX from being preempted while
+# Wi-Fi processes its TX queue.
+# CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0 is not set
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y

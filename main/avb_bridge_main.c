@@ -284,6 +284,11 @@ void app_main(void) {
   avb_config.eth_handle = s_eth_handle;
   avb_config.eth_interface = "ETH_0";
   avb_config.wifi_interface = "WIFI_0";
+  /* Bench-experiment opt-in: propagate Class A streams onto Wi-Fi
+   * even though the medium can't meet the Milan §5.6 125 us budget.
+   * Lets us validate the bridge data plane end-to-end while the
+   * Class B path is blocked by upstream switch enforcement. */
+  avb_config.allow_class_a_over_wifi = true;
 
   bool enable = true;
   if (esp_eth_ioctl(s_eth_handle, ETH_CMD_S_PROMISCUOUS, &enable) != ESP_OK) {
