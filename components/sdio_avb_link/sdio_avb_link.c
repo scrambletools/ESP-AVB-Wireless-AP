@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: MIT
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * P4-side SDIO host driver for ESP-AVB-Bridge. Phase 4 in
- * progress — protocol surface defined in sdio_avb_link.h, transport
- * bring-up pending hardware verification (SDIO host pin map for the
- * Waveshare ESP32-P4-WiFi6-PoE-ETH combo board).
+ * Host-side SDIO driver for ESP-AVB-Bridge; protocol surface in
+ * sdio_avb_link.h.
  */
 
 #include "sdio_avb_link.h"
@@ -20,7 +18,7 @@ static sdio_avb_rx_cb_t s_rx_cb[SDIO_AVB_CH_COUNT] = {0};
 static void *s_rx_ctx[SDIO_AVB_CH_COUNT] = {0};
 
 int sdio_avb_link_init(void) {
-  ESP_LOGW(TAG, "Phase 4 stub — SDIO transport not yet wired");
+  ESP_LOGW(TAG, "SDIO transport not yet wired");
   return 0;
 }
 
@@ -41,6 +39,5 @@ int sdio_avb_link_send(sdio_avb_channel_t channel,
   (void)channel;
   (void)payload;
   (void)length;
-  /* Phase 4 stub: no-op until SDIO transport lands. */
   return -ENOSYS;
 }

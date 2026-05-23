@@ -1,0 +1,69 @@
+menu "AVB Bridge Configuration"
+
+    config AVB_BRIDGE_PERF_TEST_MODE
+        bool "Perf-test mode (skip PTP/AVB, blast AVTP frames out WiFi AP)"
+        default n
+        help
+            Replaces the production bring-up with a pure data-plane test.
+            Only NVS + esp_event + WiFi SoftAP come up; Ethernet, ptpd
+            and the AVB stack are NOT started. A TX task loops
+            esp_wifi_internal_tx with a pre-built AVTP-AAF frame so the
+            path under measurement is P4 -> SDIO -> coprocessor ->
+            802.11 -> STA. Counters are sampled by a 1 Hz stats task
+            that logs pps and Mbps; the hot path itself does no
+            logging or atomics. Pair with CONFIG_AVB_ENDPOINT_PERF_TEST_MODE
+            on the C6 wireless endpoint to measure end-to-end.
+
+    config AVB_BRIDGE_PERF_TEST_DEST_MAC
+        string "Test destination MAC (six colon-separated hex octets)"
+        default "91:e0:f0:00:fe:00"
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            Destination MAC for the synthesised AVTP frames. Default is
+            an AVTP multicast address. The endpoint perf-test mode's
+            matching DEST_MAC must equal this for frames to be counted.
+
+    config AVB_BRIDGE_PERF_TEST_STREAM_ID
+        string "Test AVTP stream ID (eight colon-separated hex octets)"
+        default "80:f1:b2:d2:ca:e0:00:01"
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            8-byte stream_id placed at bytes [4..11] of the AVTP common
+            header. Endpoint must match. Default uses the bridge's wired
+            EMAC MAC suffix; any 64-bit value works.
+
+    config AVB_BRIDGE_PERF_TEST_PAYLOAD_BYTES
+        int "Payload bytes after the 24-byte AVTP header"
+        default 192
+        range 0 1400
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            Total L2 frame length = 14 (Eth) + 4 (VLAN) + 24 (AVTP) +
+            payload. Default 192 matches a Milan AAF stream at 48 kHz /
+            8 ch / 24-bit-in-32 on Class A (6 samples * 8 ch * 4 B
+            container). 96 = same format, 2 ch. 48 = Class B 48 kHz /
+            2 ch / 16-bit.
+
+    config AVB_BRIDGE_PERF_TEST_INTERVAL_US
+        int "Inter-packet interval microseconds (0 = back-to-back)"
+        default 0
+        range 0 1000000
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            Spacing between consecutive transmits. 0 means submit as
+            fast as esp_wifi_internal_tx accepts (sustained rate is
+            then the SDIO + 802.11 path's actual ceiling). 250 emulates
+            Class B AAF cadence, 125 emulates Class A.
+
+    config AVB_BRIDGE_PERF_TEST_DURATION_SEC
+        int "Test duration seconds (0 = run forever)"
+        default 10
+        range 0 86400
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            Counted from the moment the first STA associates and the TX
+            loop actually begins. After expiry the TX task stops and
+            prints a one-line summary; the SoftAP keeps running so the
+            endpoint heartbeat continues to log final-second values.
+
+endmenu

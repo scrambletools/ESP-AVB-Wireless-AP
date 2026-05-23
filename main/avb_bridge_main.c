@@ -17,6 +17,9 @@
  */
 
 #include "avbbridge.h"
+#ifdef CONFIG_AVB_BRIDGE_PERF_TEST_MODE
+#include "avb_bridge_perf_test.h"
+#endif
 #include "esp_avb.h"
 #include "esp_eth_clock.h"
 #include <driver/gpio.h>
@@ -79,16 +82,14 @@ static void on_ap_sta_disconnected(void *arg, esp_event_base_t base,
   ESP_LOGI(TAG, "AP STA disassociated; count=%u", s_ap_sta_count);
 }
 
-/* SoftAP defaults. Open auth for initial proof-of-concept;
- * encrypted Wi-Fi (WPA2/3) is in the plan. */
+/* SoftAP defaults. Open auth for now. */
 #define AVB_AP_SSID "ESP-AVB-Bridge"
 #define AVB_AP_CHANNEL 6
 #define AVB_AP_MAX_CONN 4
-/* Beacon interval — TUs of 1024 µs. 100 TU = 102.4 ms, the spec
- * default. IEEE 802.1AS-2020 §12.8.2 prefers ~125 ms
- * (logSyncInterval = -3) for gPTP over Wi-Fi; ESP-IDF documents
- * beacon_interval in multiples of 100, so we accept the small
- * mismatch. May revisit once beacon-IE jitter is measured. */
+/* Beacon interval in TUs of 1024 µs. 100 TU = 102.4 ms; the small
+ * mismatch with 802.1AS §12.8.2's preferred 125 ms (logSyncInterval
+ * = -3) is accepted because ESP-IDF advertises beacon_interval in
+ * multiples of 100. */
 #define AVB_AP_BEACON_INTERVAL 100
 
 static void init_ethernet_and_netif(void) {
@@ -137,19 +138,15 @@ static void init_ethernet_and_netif(void) {
   ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
 }
 
-/* Bring up the SoftAP via esp_wifi_remote (transparent SDIO RPC to
- * the onboard coprocessor). The first esp_wifi_init call drives the
- * SDIO host-coprocessor handshake; if the coprocessor is unreachable
- * (wedged / firmware mismatch / cable issue) any of these esp_wifi_*
- * RPCs can return failure. We DON'T ESP_ERROR_CHECK them — an abort
- * here would put the P4 into a reboot loop. Instead we propagate the
- * error to app_main, which drops into wired-only degraded mode. */
+/* SoftAP brought up via esp_wifi_remote (SDIO RPC to the coprocessor).
+ * Returning the error from any esp_wifi_* call lets app_main esp_restart;
+ * combined with the configured coprocessor reset on every host boot this
+ * gives a self-healing reset/retry cycle. */
 #define WIFI_CHECK(call, what)                                                 \
   do {                                                                         \
     esp_err_t _e = (call);                                                     \
     if (_e != ESP_OK) {                                                        \
-      ESP_LOGE(TAG, "%s failed (%s) — coprocessor unreachable; "               \
-                    "bridge will run wired-only",                              \
+      ESP_LOGE(TAG, "%s failed (%s) — coprocessor unreachable; restarting",   \
                (what), esp_err_to_name(_e));                                   \
       return _e;                                                               \
     }                                                                          \
@@ -162,12 +159,9 @@ static esp_err_t init_wifi_softap(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
   }
 
-  /* Create the AP netif. ESP_NETIF_FLAG_AUTOUP keeps the netif up
-   * regardless of L3 (we have no IP on the AP — it's an L2 bridge
-   * member). The bridge example uses the same flag pattern.
-   *
-   * if_key="WIFI_0" matches what avb_config.wifi_interface passes
-   * down so esp_avb's port[1] L2TAP fds bind to this exact netif. */
+  /* AP netif is an L2 bridge member — no L3, so ESP_NETIF_FLAG_AUTOUP
+   * keeps it up regardless. if_key="WIFI_0" must match the value
+   * passed via avb_config.wifi_interface so port[1] binds here. */
   esp_netif_inherent_config_t ap_inherent =
       ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
   ap_inherent.flags = ESP_NETIF_FLAG_AUTOUP;
@@ -192,9 +186,8 @@ static esp_err_t init_wifi_softap(void) {
               .max_connection = AVB_AP_MAX_CONN,
               .authmode = WIFI_AUTH_OPEN,
               .beacon_interval = AVB_AP_BEACON_INTERVAL,
-              /* FTM responder so wireless endpoints can measure
-               * peer-delay against us per Path C. The coprocessor HW
-               * supports it; ESP-Hosted RPCs the flag transparently. */
+              /* FTM responder so wireless STAs can measure peer-delay
+               * against this AP. */
               .ftm_responder = true,
           },
   };
@@ -214,7 +207,7 @@ static esp_err_t init_wifi_softap(void) {
   s_ap_started = xSemaphoreCreateBinary();
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,
                                              on_ap_start, NULL));
-  /* Long-lived STA-count handlers — feed esp_avb's LeaveAll suppression. */
+  /* STA-count handlers feed MRP LeaveAll suppression. */
   ESP_ERROR_CHECK(esp_event_handler_register(
       WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, on_ap_sta_connected, NULL));
   ESP_ERROR_CHECK(esp_event_handler_register(
@@ -234,6 +227,15 @@ static esp_err_t init_wifi_softap(void) {
 #undef WIFI_CHECK
 
 void app_main(void) {
+#ifdef CONFIG_AVB_BRIDGE_PERF_TEST_MODE
+  /* Perf-test mode bypasses every production subsystem. Brings up
+   * only NVS + WiFi SoftAP and blasts AVTP-shaped frames at
+   * esp_wifi_internal_tx to measure the SDIO -> coprocessor -> 802.11
+   * path. Never returns. */
+  avb_bridge_perf_test_run();
+  return;
+#endif
+
   struct timespec cur_time;
 
   init_ethernet_and_netif();
@@ -251,43 +253,27 @@ void app_main(void) {
 
   esp_err_t wifi_rc = init_wifi_softap();
   if (wifi_rc != ESP_OK) {
-    /* Coprocessor / SDIO failed. Wired ptpd (started above on port 0)
-     * keeps running in its own task; we just park app_main here so the
-     * P4 stays alive instead of cascading into a reboot. Recovery
-     * requires a real C6 reset — see AGENTS.md for the manual
-     * procedure. */
-    ESP_LOGW(TAG, "Bridge entering wired-only degraded mode "
-                  "(Wi-Fi init returned %s). Wired ptpd continues on "
-                  "port 0; AVB stack is NOT started.",
+    /* esp-hosted's own no-INIT timeout normally restarts
+     * us from inside the wifi init path; reaching here means a later
+     * esp_wifi_* call failed. Restart so the next boot pulses the
+     * coprocessor reset GPIO and retries from scratch. */
+    ESP_LOGE(TAG, "init_wifi_softap returned %s; restarting host",
              esp_err_to_name(wifi_rc));
-    while (1) {
-      vTaskDelay(pdMS_TO_TICKS(30000));
-      ESP_LOGW(TAG, "heartbeat (degraded, wired ETH + ptpd only)");
-    }
+    esp_restart();
   }
 
-  /* Attach the Wi-Fi port to the running daemon (port 1 = wifi_ftm,
-   * SoftAP). No socket opens; Sync transport is the SoftAP's 802.11
-   * Beacon Vendor IE driven by the sync_egress_cb registered by
-   * esp_ptp/ptp_beacon_ie.c on WIFI_EVENT_AP_START. The daemon's
-   * periodic-send loop fires the callback at the configured gPTP
-   * Sync interval; peer-delay on this port is FTM-driven (none on
-   * the AP side — STAs initiate FTM toward us). */
+  /* Wi-Fi port: Sync transport is the beacon Vendor IE; peer-delay is
+   * FTM-driven (responder side, no measurement). */
   ptpd_start_port(1, "WIFI_0", ptp_port_medium_wifi_ftm);
 
-  /* AVB stack — bridge role. NUM_PORTS=2: port[0]=Ethernet (EMAC),
-   * port[1]=Wi-Fi AP (over esp_wifi_remote → onboard C6). The L2
-   * forwarder runs out of esp_avb's avb_unified_rx_cb on both
-   * ingress hooks (EMAC for port 0, WIFI_IF_AP for port 1). */
+  /* Bridge role: port 0 = Ethernet (EMAC), port 1 = Wi-Fi AP. */
   avb_config_s avb_config = AVB_DEFAULT_CONFIG();
   avb_config.entity_name = "AVB Bridge";
   avb_config.eth_handle = s_eth_handle;
   avb_config.eth_interface = "ETH_0";
   avb_config.wifi_interface = "WIFI_0";
-  /* Bench-experiment opt-in: propagate Class A streams onto Wi-Fi
-   * even though the medium can't meet the Milan §5.6 125 us budget.
-   * Lets us validate the bridge data plane end-to-end while the
-   * Class B path is blocked by upstream switch enforcement. */
+  /* Allow Class A on Wi-Fi despite the medium not meeting Milan
+   * §5.6 125 µs latency. */
   avb_config.allow_class_a_over_wifi = true;
 
   bool enable = true;
@@ -309,13 +295,7 @@ void app_main(void) {
 
   avb_start(&avb_config);
 
-  /* Beacon-IE publish is fully owned by esp_ptp. The daemon's
-   * periodic-send loop fires the sync_egress_cb on the wifi_ftm port
-   * at the gPTP Sync interval; esp_ptp/ptp_beacon_ie.c registers the
-   * callback on WIFI_EVENT_AP_START and packs the daemon-marshalled
-   * FollowUpInformation bytes into a Vendor IE for the coprocessor
-   * to set via esp_wifi_set_vendor_ie(). Nothing for this host to do
-   * past bringing up the SoftAP and attaching port 1 above. */
+  /* Beacon-IE publish is owned by esp_ptp; nothing more to do here. */
 
   ESP_LOGI(TAG, "AVB bridge up — Ethernet + Wi-Fi AP, L2 forwarder armed");
 

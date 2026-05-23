@@ -44,7 +44,6 @@ CONFIG_ESP_PTP_PORT1_WIFI_MODE_AP=y
 CONFIG_ESP_PTP_PORT1_LINK_SPEED_MBPS=150
 
 # gPTP intervals matching the example.
-CONFIG_NETUTILS_PTPD_PRIORITY1=246
 CONFIG_NETUTILS_PTPD_TIMEOUT_MS=10000
 CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS=100
 CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS=125
@@ -91,34 +90,25 @@ CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
 CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
 CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=4
 
-# Don't let ESP-Hosted reboot the P4 host when an SDIO command times
-# out talking to the C6. The default behavior calls esp_restart() from
-# H_SDIO_DRV, which puts the P4 into a perpetual reboot loop whenever
-# the C6 wedges (observed: every ~16.5 s). With this off the host
-# logs the SDIO failure and keeps running — Wi-Fi degrades, but the
-# wired-side ptpd, EMAC forwarding, and ATDECC stay up.
-CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n
+# Restart the P4 when the SDIO transport reports a runtime failure
+# (e.g., C6 reset / wedged underneath us). Combined with the
+# SLAVE_RESET_ON_EVERY_HOST_BOOTUP knob below, each restart pulses
+# GPIO 54 to bring the C6 to a known state, so recovery converges.
+CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=y
 
-# Don't pulse the C6 reset GPIO on every host boot — verified across
-# three P4-only reset trials that the slave gracefully re-handshakes
-# with a re-initing host without needing a reset (it re-emits
-# ESP_PRIV_EVENT_INIT on demand and reuses its existing Wi-Fi state).
-# The "_ONLY_IF_NECESSARY" path probes SDIO first and only pulses
-# GPIO 54 if card init fails — which is the only case where a reset
-# would actually be useful. Avoids ~1.5 s of pointless reset delay on
-# every host boot and stops "Reset slave using GPIO[54]" logs that
-# weren't doing anything anyway.
-# CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP is not set
-CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
+# Pulse the C6 reset GPIO on every host boot. _ONLY_IF_NECESSARY gates
+# the GPIO reset on transport_card_init failure, but the observed wedge
+# is "card init succeeds, C6 firmware never sends ESP_PRIV_EVENT_INIT" —
+# that path doesn't reach the reset branch. Resetting unconditionally
+# costs ~1.5 s per boot but covers both dead-controller and
+# wedged-slave-firmware cases.
+CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP=y# CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY is not set
 
-# Also disable the "host restarts itself if slave never sends INIT" path.
-# With RESET_ONLY_IF_NECESSARY, if the C6 is alive but didn't see the
-# P4 go away (so it doesn't re-emit ESP_PRIV_EVENT_INIT) the host would
-# otherwise hit this timeout and call esp_restart() — putting the P4
-# back into the same cascade we already disabled. With this off the
-# timeout fires harmlessly (logged), then esp_wifi_init returns ESP_FAIL
-# and our init_wifi_softap graceful path drops into wired-only mode.
-# CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE is not set
+# Host restarts itself if the slave never sends INIT within the
+# configured timeout (default 5 s). Together with the GPIO-reset on
+# next boot, this converts "slave wedged" into a self-healing
+# reboot/reset cycle rather than silent half-bridge degradation.
+CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE=y
 
 # FreeRTOS / EMAC settings cloned from the example.
 CONFIG_FREERTOS_ISR_STACKSIZE=6144

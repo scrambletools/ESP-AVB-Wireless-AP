@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: MIT
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * SDIO transport between the ESP32-P4 host and the onboard ESP32-C6
- * Wi-Fi coprocessor on ESP-AVB-Bridge. ESP-Hosted-style framing
- * with 6 channels, 12-byte header, credit-based flow control on
- * channel 1 (control). Implementation is Phase 4 in-progress; this
- * header defines the protocol so both sides can agree.
+ * SDIO transport between the host and the onboard Wi-Fi coprocessor.
+ * ESP-Hosted-style framing: 6 channels, 12-byte header, credit-based
+ * flow control on channel 1.
  */
 
 #ifndef SDIO_AVB_LINK_H
@@ -18,7 +16,7 @@
 extern "C" {
 #endif
 
-/* Channel identifiers — kept in sync between host and slave. */
+/* Channel identifiers — kept in sync between host and coprocessor. */
 typedef enum {
   SDIO_AVB_CH_DATA = 0,      /* bridged 802.3 frames, both directions */
   SDIO_AVB_CH_CONTROL = 1,   /* AP up/down, association events, credits */
@@ -63,7 +61,7 @@ typedef void (*sdio_avb_rx_cb_t)(sdio_avb_channel_t channel,
                                  size_t length,
                                  void *ctx);
 
-/* Public API — implementation lands in Phase 4 SDIO bring-up. */
+/* Public API. */
 int sdio_avb_link_init(void);
 int sdio_avb_link_register_rx_cb(sdio_avb_channel_t channel,
                                  sdio_avb_rx_cb_t cb,
