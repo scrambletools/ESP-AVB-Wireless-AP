@@ -241,16 +241,15 @@ void app_main(void) {
   init_ethernet_and_netif();
   ESP_LOGI(TAG, "Ethernet started");
 
-  /* Start ptpd on the wired side first (port 0 = eth_hwts). This
-   * spawns the daemon task and opens the L2TAP socket; once
-   * CLOCK_PTP_SYSTEM is readable below, ptp_initialize_state has
-   * finished and the daemon is in its main loop. */
-  ptpd_start_port(0, s_avb_eth_interface, ptp_port_medium_eth_hwts);
-
-  while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-
+  /* Bring up the Wi-Fi SoftAP (and its underlying SDIO/coprocessor
+   * RPC traffic burst) BEFORE starting PTPD. The bringup transient
+   * disturbs PI servo convergence enough to drive freq_ppb to large
+   * transient values; with the HAL's multiplicative ADJ_FREQUENCY,
+   * those transients compound into a sustained rate offset that blows
+   * past 802.1AS's ±200 ppm neighborRateRatio window and trips
+   * asCapable on strict peers (e.g. PreSonus). Letting SDIO/SoftAP
+   * fully initialize first means PTPD converges in a quiet
+   * environment. */
   esp_err_t wifi_rc = init_wifi_softap();
   if (wifi_rc != ESP_OK) {
     /* esp-hosted's own no-INIT timeout normally restarts
@@ -260,6 +259,18 @@ void app_main(void) {
     ESP_LOGE(TAG, "init_wifi_softap returned %s; restarting host",
              esp_err_to_name(wifi_rc));
     esp_restart();
+  }
+  /* Brief settle so the SDIO ring + RPC handlers stop their
+   * initialization burst before PTPD enters its PI convergence. */
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  /* Now start PTPD on the wired side (port 0 = eth_hwts). Spawns the
+   * daemon task and opens the L2TAP socket; CLOCK_PTP_SYSTEM becomes
+   * readable once ptp_initialize_state has finished. */
+  ptpd_start_port(0, s_avb_eth_interface, ptp_port_medium_eth_hwts);
+
+  while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
+    vTaskDelay(pdMS_TO_TICKS(500));
   }
 
   /* Wi-Fi port: Sync transport is the beacon Vendor IE; peer-delay is
