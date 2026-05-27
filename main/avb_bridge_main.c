@@ -310,15 +310,25 @@ void app_main(void) {
 
   ESP_LOGI(TAG, "AVB bridge up — Ethernet + Wi-Fi AP, L2 forwarder armed");
 
+  uint32_t first_ucast_ms = 0;
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     uint32_t eth_ok = 0, eth_fail = 0, wifi_ok = 0, wifi_fail = 0, wifi_oom = 0;
     avb_bridge_forward_stats(&eth_ok, &eth_fail, &wifi_ok, &wifi_fail,
                              &wifi_oom);
+    uint32_t wifi_ucast = 0, wifi_mcast = 0;
+    avb_bridge_forward_stats_wifi_split(&wifi_ucast, &wifi_mcast);
+    if (first_ucast_ms == 0 && wifi_ucast > 0) {
+      first_ucast_ms = esp_log_timestamp();
+      ESP_LOGI(TAG, "first wifi-egress UNICAST forward succeeded at uptime=%lums",
+               (unsigned long)first_ucast_ms);
+    }
     ESP_LOGI(TAG,
-             "heartbeat  fwd eth=%lu/%lu  wifi=%lu/%lu  oom=%lu  STA=%u",
+             "heartbeat  fwd eth=%lu/%lu  wifi=%lu/%lu (ucast=%lu mcast=%lu)  "
+             "oom=%lu  STA=%u",
              (unsigned long)eth_ok, (unsigned long)eth_fail,
              (unsigned long)wifi_ok, (unsigned long)wifi_fail,
+             (unsigned long)wifi_ucast, (unsigned long)wifi_mcast,
              (unsigned long)wifi_oom, avb_bridge_wifi_ap_sta_count());
   }
 }

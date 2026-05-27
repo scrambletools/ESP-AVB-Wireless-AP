@@ -101,8 +101,11 @@ CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=y
 # is "card init succeeds, C6 firmware never sends ESP_PRIV_EVENT_INIT" —
 # that path doesn't reach the reset branch. Resetting unconditionally
 # costs ~1.5 s per boot but covers both dead-controller and
-# wedged-slave-firmware cases.
-CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP=y# CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY is not set
+# wedged-slave-firmware cases. The thrash of an associated STA's per-STA
+# wifi-driver TX scheduler that this triggers is handled on the endpoint
+# side (esp_ptp's TSF-discontinuity detection forces a clean reauth).
+CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP=y
+# CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY is not set
 
 # Host restarts itself if the slave never sends INIT within the
 # configured timeout (default 5 s). Together with the GPIO-reset on
