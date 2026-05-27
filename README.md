@@ -12,6 +12,11 @@ The pairing target is the wireless build of
 but any Milan-compatible AVB endpoint on the wired side or any STA on
 the SoftAP that speaks AVB-over-Wi-Fi will interoperate.
 
+## issues
+
+- forwarding some unicast traffic from the wired side to the wireless is unstable
+- this is software is in early development, intended for limited testing only
+
 ## Capabilities
 
 - Transparent L2 forwarder for AVTP control (ADP / AECP / ACMP / MAAP),
