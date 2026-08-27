@@ -383,7 +383,7 @@ void app_main(void) {
     ESP_LOGI(TAG,
              "heartbeat  fwd eth=%lu/%lu  wifi=%lu/%lu (ucast=%lu mcast=%lu)  "
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
-             "readdr=%lu/nomap=%lu/bpdrop=%lu  "
+             "readdr=%lu/nomap=%lu/bpdrop=%lu/restore=%lu  "
 #endif
              "oom=%lu  STA=%u",
              (unsigned long)eth_ok, (unsigned long)eth_fail,
@@ -392,6 +392,7 @@ void app_main(void) {
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
              (unsigned long)readdr, (unsigned long)nomap,
              (unsigned long)avb_bridge_forward_stats_bp_drop(),
+             (unsigned long)avb_bridge_forward_stats_restored(),
 #endif
              (unsigned long)wifi_oom, avb_bridge_wifi_ap_sta_count());
   }
