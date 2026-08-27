@@ -113,8 +113,16 @@ CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP=y
 # reboot/reset cycle rather than silent half-bridge degradation.
 CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE=y
 
-# FreeRTOS / EMAC settings cloned from the example.
-CONFIG_FREERTOS_ISR_STACKSIZE=6144
+# ISR stack is PER-CORE, so the P4 pays this twice. The previous 6144
+# (12 KiB total, 4x the IDF default of 1536) starved RETENT_RAM below
+# the threshold sleep_retention_entries_create needs, and the bridge
+# boot-looped in sleep_clock_icg_init long before app_main -- a failure
+# that reports as "failed to allocate memory for system sleep clock
+# ICG" and looks nothing like a RAM shortage. Before raising this,
+# check the RETENT_RAM line in the boot log: below ~136 KiB the bridge
+# will not boot. CONFIG_ESP_SYSTEM_HW_STACK_GUARD is on, so a
+# too-small ISR stack panics immediately rather than corrupting memory.
+CONFIG_FREERTOS_ISR_STACKSIZE=2048
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_ETH_TRANSMIT_MUTEX=n
@@ -143,3 +151,31 @@ CONFIG_ESP_WIFI_TX_BA_WIN=64
 # Wi-Fi processes its TX queue.
 # CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0 is not set
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+
+# 32 MB stacked PSRAM (ESP32-P4NRW32). Enabled so runtime allocation
+# storms land in a 32 MB pool instead of killing the board: internal
+# DIRAM is 572 KB and this bridge has already hit two of its cliffs
+# (RETENT_RAM starvation at boot, and an episodic >250 KB/s allocation
+# burst that exhausted the heap at ~8 s uptime). Small allocations
+# (< SPIRAM_MALLOC_ALWAYSINTERNAL, default 16 KB) and anything
+# DMA-capable stay internal, so the EMAC/SDIO hot paths are unaffected.
+# P4 Kconfig defaults give HEX mode at 200 MHz. IGNORE_NOTFOUND keeps
+# a board with unfitted/failed PSRAM booting instead of aborting.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# The bridge is an always-on device that never enters light sleep, so
+# the sleep-clock ICG retention module is dead weight -- and worse, it
+# was the boot cliff: its REGDMA lists allocate from the RETENT_RAM
+# window (the low-DIRAM residue left after IRAM code and .data/.bss),
+# and whenever static growth squeezed that window below ~136 KiB the
+# init function failed ESP_ERR_NO_MEM and cpu_start aborted before
+# app_main. Disabling it compiles the module out entirely, removing
+# both the allocation and the failure mode. Re-enable only if the
+# bridge ever adopts light sleep.
+CONFIG_PM_SLEEP_CLK_ICG_ENABLE=n
+# Heap component runs from flash (cached XIP): proven under sustained
+# 8000 pps forwarding (bpdrop=0), saves ~3 KB of IRAM. Do NOT also move
+# FreeRTOS to flash: that configuration died on a spinlock recursion
+# assert in the tick hook after ~5 min at line rate.
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
