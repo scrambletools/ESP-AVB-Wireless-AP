@@ -6,7 +6,7 @@ dependencies:
   # README — onboard C6 over SDIO), regardless of the host chip the
   # bridge happens to run on.
   espressif/esp_wifi_remote: ">=1.3.1,<2.0"
-  espressif/esp_hosted: ">=2.11.0"
+  espressif/esp_hosted: "==2.12.7"   # exact match to the coprocessor slave built from esp-hosted-mcu @ 2.12.7
   scrambletools/esp_ptp: "*"
   scrambletools/esp_ptp_rpc: "*"
   scrambletools/esp_avb: "*"
