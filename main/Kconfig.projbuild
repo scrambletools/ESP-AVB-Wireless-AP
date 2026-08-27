@@ -32,6 +32,36 @@ menu "AVB Bridge Configuration"
             header. Endpoint must match. Default uses the bridge's wired
             EMAC MAC suffix; any 64-bit value works.
 
+    config AVB_BRIDGE_PERF_TEST_RX_MODE
+        bool "Perf-test direction: RECEIVE (uplink) instead of transmit"
+        default n
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            Default (n) is the transmit role: blast AVTP frames down to
+            associated STAs. Set y to invert the role — the SoftAP still
+            comes up, but instead of transmitting, an RX hook on
+            WIFI_IF_AP counts matching AVTP frames arriving from a STA.
+
+            This exists to measure the uplink direction, which is not
+            symmetric with downlink: downlink group-addressed frames are
+            DTIM-buffered and never retried, while uplink frames carry
+            Address 1 = BSSID (IEEE 802.11 Table 9-30) and so are ACKed
+            and retried even when the MSDU is group addressed. Pair with
+            CONFIG_AVB_ENDPOINT_PERF_TEST_TX_MODE on the endpoint.
+
+    config AVB_BRIDGE_PERF_TEST_CHANNEL
+        int "SoftAP channel for the perf-test AP"
+        default 6
+        range 1 13
+        depends on AVB_BRIDGE_PERF_TEST_MODE
+        help
+            2.4 GHz channel the perf-test SoftAP beacons on. Sweeping
+            this across 1 / 6 / 11 with everything else held constant
+            separates "the link is contention-limited" from "the link
+            is limited by SDIO and per-frame airtime" — the latter does
+            not move with channel. The endpoint follows by SSID, so
+            only this side needs rebuilding between runs.
+
     config AVB_BRIDGE_PERF_TEST_PAYLOAD_BYTES
         int "Payload bytes after the 24-byte AVTP header"
         default 192

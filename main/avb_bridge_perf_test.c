@@ -38,7 +38,7 @@ static const char *TAG = "perf_tx";
 extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
 
 #define PERF_AP_SSID    "ESP-AVB-Bridge"
-#define PERF_AP_CHANNEL 6
+#define PERF_AP_CHANNEL CONFIG_AVB_BRIDGE_PERF_TEST_CHANNEL
 #define PERF_AP_MAX_CONN 4
 #define PERF_AP_BEACON_INTERVAL 100
 
@@ -271,6 +271,76 @@ static void perf_stats_task(void *arg) {
   }
 }
 
+#ifdef CONFIG_AVB_BRIDGE_PERF_TEST_RX_MODE
+/* ---- Uplink (STA -> AP) receive role ---------------------------------
+ * Mirror of the endpoint's perf_rx_cb. Counts AVTP frames arriving on the
+ * SoftAP interface whose dest MAC and stream_id match the configured pair,
+ * so uplink can be compared against downlink on the same basis. */
+extern esp_err_t esp_wifi_internal_reg_rxcb(
+    int wifi_if, esp_err_t (*fn)(void *buffer, uint16_t len, void *eb));
+extern esp_err_t esp_wifi_internal_free_rx_buffer(void *eb);
+
+static volatile uint64_t s_rx_pkts = 0;
+static volatile uint64_t s_rx_bytes_l2 = 0;
+static volatile uint64_t s_rx_seq_gaps = 0;
+static volatile uint64_t s_rx_filtered_dest = 0;
+static volatile uint64_t s_rx_filtered_stream = 0;
+static volatile uint8_t  s_rx_last_seq = 0;
+static volatile bool     s_rx_seq_valid = false;
+
+static uint8_t s_match_dest_mac[6];
+static uint8_t s_match_stream_id[8];
+
+static esp_err_t perf_rx_cb(void *buffer, uint16_t len, void *eb) {
+  if (len < ETH_HDR_LEN + VLAN_TAG_LEN + AVTP_HDR_LEN) {
+    esp_wifi_internal_free_rx_buffer(eb);
+    return ESP_OK;
+  }
+  const uint8_t *f = (const uint8_t *)buffer;
+  if (memcmp(f, s_match_dest_mac, 6) != 0) {
+    s_rx_filtered_dest++;
+    esp_wifi_internal_free_rx_buffer(eb);
+    return ESP_OK;
+  }
+  if (f[12] != 0x81 || f[13] != 0x00 || f[16] != 0x22 || f[17] != 0xf0) {
+    esp_wifi_internal_free_rx_buffer(eb);
+    return ESP_OK;
+  }
+  const uint8_t *avtp = f + ETH_HDR_LEN + VLAN_TAG_LEN;
+  if (memcmp(avtp + 4, s_match_stream_id, 8) != 0) {
+    s_rx_filtered_stream++;
+    esp_wifi_internal_free_rx_buffer(eb);
+    return ESP_OK;
+  }
+  uint8_t seq = avtp[2];
+  if (s_rx_seq_valid && seq != (uint8_t)(s_rx_last_seq + 1)) s_rx_seq_gaps++;
+  s_rx_last_seq = seq;
+  s_rx_seq_valid = true;
+  s_rx_pkts++;
+  s_rx_bytes_l2 += (uint64_t)len;
+  esp_wifi_internal_free_rx_buffer(eb);
+  return ESP_OK;
+}
+
+static void perf_rx_stats_task(void *arg) {
+  (void)arg;
+  uint64_t last_pkts = 0, last_bytes = 0;
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint64_t p = s_rx_pkts, b = s_rx_bytes_l2;
+    uint64_t dp = p - last_pkts, db = b - last_bytes;
+    last_pkts = p; last_bytes = b;
+    ESP_LOGI(TAG, "uplink rx pps=%llu L2=%.2fMbps gaps=%llu total=%llu "
+                  "filt(dest=%llu,stream=%llu) sta=%lu",
+             (unsigned long long)dp, (double)(db * 8ULL) / 1e6,
+             (unsigned long long)s_rx_seq_gaps, (unsigned long long)p,
+             (unsigned long long)s_rx_filtered_dest,
+             (unsigned long long)s_rx_filtered_stream,
+             (unsigned long)s_sta_count);
+  }
+}
+#endif /* CONFIG_AVB_BRIDGE_PERF_TEST_RX_MODE */
+
 static void on_ap_event(void *arg, esp_event_base_t base, int32_t id,
                         void *data) {
   (void)arg; (void)base;
@@ -345,6 +415,21 @@ void avb_bridge_perf_test_run(void) {
    * (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y) so the WiFi task and the
    * caller end up co-resident, avoiding cross-core hand-offs in the
    * hot path. Stats task left unpinned. */
+#ifdef CONFIG_AVB_BRIDGE_PERF_TEST_RX_MODE
+  if (parse_mac(CONFIG_AVB_BRIDGE_PERF_TEST_DEST_MAC, s_match_dest_mac) != 0) {
+    ESP_LOGW(TAG, "bad dest MAC, uplink RX filter will not match");
+  }
+  if (parse_stream_id(CONFIG_AVB_BRIDGE_PERF_TEST_STREAM_ID,
+                      s_match_stream_id) != 0) {
+    ESP_LOGW(TAG, "bad stream id, uplink RX filter will not match");
+  }
+  {
+    esp_err_t r = esp_wifi_internal_reg_rxcb(1 /* WIFI_IF_AP */, perf_rx_cb);
+    ESP_LOGI(TAG, "uplink RX hook on WIFI_IF_AP: %s", esp_err_to_name(r));
+  }
+  xTaskCreate(perf_rx_stats_task, "perf_rxstats", 4096, NULL, 5, NULL);
+#else
   xTaskCreatePinnedToCore(perf_tx_task, "perf_tx", 4096, NULL, 10, NULL, 1);
   xTaskCreate(perf_stats_task, "perf_stats", 4096, NULL, 5, NULL);
+#endif
 }
