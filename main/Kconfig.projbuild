@@ -38,7 +38,7 @@ menu "AVB Bridge Configuration"
         depends on AVB_BRIDGE_PERF_TEST_MODE
         help
             Default (n) is the transmit role: blast AVTP frames down to
-            associated STAs. Set y to invert the role — the SoftAP still
+            associated STAs. Set y to invert the role, the SoftAP still
             comes up, but instead of transmitting, an RX hook on
             WIFI_IF_AP counts matching AVTP frames arriving from a STA.
 
@@ -58,7 +58,7 @@ menu "AVB Bridge Configuration"
             2.4 GHz channel the perf-test SoftAP beacons on. Sweeping
             this across 1 / 6 / 11 with everything else held constant
             separates "the link is contention-limited" from "the link
-            is limited by SDIO and per-frame airtime" — the latter does
+            is limited by SDIO and per-frame airtime", the latter does
             not move with channel. The endpoint follows by SSID, so
             only this side needs rebuilding between runs.
 

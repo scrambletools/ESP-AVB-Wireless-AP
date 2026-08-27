@@ -116,7 +116,7 @@ CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE=y
 # ISR stack is PER-CORE, so the P4 pays this twice. The previous 6144
 # (12 KiB total, 4x the IDF default of 1536) starved RETENT_RAM below
 # the threshold sleep_retention_entries_create needs, and the bridge
-# boot-looped in sleep_clock_icg_init long before app_main -- a failure
+# boot-looped in sleep_clock_icg_init long before app_main, a failure
 # that reports as "failed to allocate memory for system sleep clock
 # ICG" and looks nothing like a RAM shortage. Before raising this,
 # check the RETENT_RAM line in the boot log: below ~136 KiB the bridge
@@ -165,7 +165,7 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 
 # The bridge is an always-on device that never enters light sleep, so
-# the sleep-clock ICG retention module is dead weight -- and worse, it
+# the sleep-clock ICG retention module is dead weight, and worse, it
 # was the boot cliff: its REGDMA lists allocate from the RETENT_RAM
 # window (the low-DIRAM residue left after IRAM code and .data/.bss),
 # and whenever static growth squeezed that window below ~136 KiB the
