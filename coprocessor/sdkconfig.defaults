@@ -7,11 +7,17 @@
 # esp_ptp_rpc component (symlinked into ./components/).
 CONFIG_PTP_RPC_BUILD_COPROCESSOR_HANDLER=y
 
-# Bring-up diagnostics: verbose bootloader + DEBUG runtime logs on
-# the coprocessor's UART0 so flash/boot issues are visible without
-# rebuilding. Drop these once Phase 8 stabilizes.
+# Bring-up diagnostics: verbose bootloader logs on the coprocessor's
+# UART0 so flash/boot issues are visible without rebuilding. Bootloader
+# output is boot-only, so it costs nothing in steady state.
 CONFIG_BOOTLOADER_LOG_LEVEL_VERBOSE=y
-CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+# Runtime log level is INFO, NOT DEBUG. At DEBUG the slave hex-dumps
+# every bus_RX packet to UART0; at 115200 baud that alone caps the
+# Wi-Fi data path at a few tens of packets/s and starves recv_task
+# badly enough to trip the task watchdog. UART TX blocks whether or
+# not anything is listening on the wire, so this throttles the bridge
+# in normal operation, not just when a console is attached.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 
 # FTM: responder on the SoftAP per IEEE 802.1AS-2020 §12.1.2. STAs
