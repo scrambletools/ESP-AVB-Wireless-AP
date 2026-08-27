@@ -20,6 +20,9 @@
 #ifdef CONFIG_AVB_BRIDGE_PERF_TEST_MODE
 #include "avb_bridge_perf_test.h"
 #endif
+#include "sdkconfig.h"
+/* Self-gates on CONFIG_HEAP_TASK_TRACKING internally. */
+#include "esp_heap_task_info.h"
 #include "esp_avb.h"
 #include "esp_eth_clock.h"
 #include <driver/gpio.h>
@@ -226,7 +229,57 @@ static esp_err_t init_wifi_softap(void) {
 }
 #undef WIFI_CHECK
 
+/* Diagnostic build only (sdkconfig.census): 1 Hz heap census. Prints
+ * total free / largest block / low-water mark, then per-task allocation
+ * totals, so the consumer of a runtime heap exhaustion can be named
+ * instead of guessed. */
+#define CENSUS_MAX_TASKS 24
+static void heap_census_task(void *arg) {
+  (void)arg;
+  size_t last_free = 0;
+  int quiet = 0;
+  while (1) {
+    multi_heap_info_t hi;
+    heap_caps_get_info(&hi, MALLOC_CAP_8BIT);
+    size_t f = hi.total_free_bytes;
+    /* 100 ms tick; print on >4 KB movement, else once a minute, so a
+     * sub-second allocation storm leaves a visible trail without the
+     * quiet steady state spamming the console. */
+    bool moved = (f > last_free ? f - last_free : last_free - f) > 4096;
+    if (moved || ++quiet >= 600) {
+      quiet = 0;
+      ESP_LOGW("census", "free=%u largest=%u min_ever=%u allocs=%u%s",
+               (unsigned)f, (unsigned)hi.largest_free_block,
+               (unsigned)hi.minimum_free_bytes,
+               (unsigned)hi.total_allocated_bytes, moved ? "  <-- DELTA" : "");
+    }
+    last_free = f;
+#ifdef CONFIG_HEAP_TASK_TRACKING
+    static heap_task_totals_t totals[CENSUS_MAX_TASKS];
+    size_t num_totals = 0;
+    heap_task_info_params_t p = {0};
+    p.caps[0] = MALLOC_CAP_8BIT;
+    p.mask[0] = MALLOC_CAP_8BIT;
+    p.tasks = NULL;
+    p.num_tasks = 0;
+    p.totals = totals;
+    p.num_totals = &num_totals;
+    p.max_totals = CENSUS_MAX_TASKS;
+    p.blocks = NULL;
+    p.max_blocks = 0;
+    heap_caps_get_per_task_info(&p);
+    for (size_t i = 0; i < num_totals; i++) {
+      ESP_LOGW("census", "  task=%-16s alloc=%u (%u blocks)",
+               totals[i].task ? pcTaskGetName(totals[i].task) : "pre-sched",
+               (unsigned)totals[i].size[0], (unsigned)totals[i].count[0]);
+    }
+#endif /* CONFIG_HEAP_TASK_TRACKING */
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void app_main(void) {
+  xTaskCreate(heap_census_task, "heap_census", 4096, NULL, 3, NULL);
 #ifdef CONFIG_AVB_BRIDGE_PERF_TEST_MODE
   /* Perf-test mode bypasses every production subsystem. Brings up
    * only NVS + WiFi SoftAP and blasts AVTP-shaped frames at
@@ -318,6 +371,10 @@ void app_main(void) {
                              &wifi_oom);
     uint32_t wifi_ucast = 0, wifi_mcast = 0;
     avb_bridge_forward_stats_wifi_split(&wifi_ucast, &wifi_mcast);
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    uint32_t readdr = 0, nomap = 0;
+    avb_bridge_forward_stats_readdress(&readdr, &nomap);
+#endif
     if (first_ucast_ms == 0 && wifi_ucast > 0) {
       first_ucast_ms = esp_log_timestamp();
       ESP_LOGI(TAG, "first wifi-egress UNICAST forward succeeded at uptime=%lums",
@@ -325,10 +382,17 @@ void app_main(void) {
     }
     ESP_LOGI(TAG,
              "heartbeat  fwd eth=%lu/%lu  wifi=%lu/%lu (ucast=%lu mcast=%lu)  "
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+             "readdr=%lu/nomap=%lu/bpdrop=%lu  "
+#endif
              "oom=%lu  STA=%u",
              (unsigned long)eth_ok, (unsigned long)eth_fail,
              (unsigned long)wifi_ok, (unsigned long)wifi_fail,
              (unsigned long)wifi_ucast, (unsigned long)wifi_mcast,
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+             (unsigned long)readdr, (unsigned long)nomap,
+             (unsigned long)avb_bridge_forward_stats_bp_drop(),
+#endif
              (unsigned long)wifi_oom, avb_bridge_wifi_ap_sta_count());
   }
 }
