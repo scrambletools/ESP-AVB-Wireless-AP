@@ -1,4 +1,5 @@
 build/
+build*/
 build.clang/
 components/esp_*
 managed_components/
